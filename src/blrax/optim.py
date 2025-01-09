@@ -50,8 +50,10 @@ class ScaleByState(NamedTuple):
   g: base.Updates
   h: base.Updates
   eps: base.Updates
+  num_datapoints: int
+  weight_decay: float
   sample_params: bool = True
-
+  
 
 def scale_by_ivon(
     key: PRNGKeyArray,
@@ -90,7 +92,15 @@ def scale_by_ivon(
     h = jax.tree_util.tree_map(lambda t: h0 * jnp.ones_like(t, dtype=m_dtype), params)  # First moment
     keys, key = random_split_like_tree(key, target=params)
     eps = jax.tree_util.tree_map(lambda t, key: jr.normal(key, shape=(mc_samples,) + t.shape), params, keys)
-    return ScaleByState(key=key, count=jnp.zeros([], jnp.int32), h=h, g=g, eps=eps)
+    return ScaleByState(
+      key=key,
+      count=jnp.zeros([], jnp.int32),
+      h=h,
+      g=g,
+      eps=eps,
+      weight_decay=wd,
+      num_datapoints=num_data
+      )
 
   def update_fn(updates, state, params):
     g_bar = jax.tree_util.tree_map(
@@ -111,7 +121,7 @@ def scale_by_ivon(
 
     keys, key = random_split_like_tree(state.key, target=params)
     eps = jax.tree_util.tree_map(lambda t, key: jr.normal(key, shape=(mc_samples,) + t.shape), params, keys)
-    return updates, ScaleByState(key=key, count=count_inc, g=g, h=h, eps=eps)
+    return updates, ScaleByState(key=key, count=count_inc, g=g, h=h, eps=eps, weight_decay=wd, num_datapoints=num_data)
 
   return base.GradientTransformation(functools.partial(init_fn, key), update_fn)
 
