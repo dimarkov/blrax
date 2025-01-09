@@ -10,7 +10,8 @@ authors = [{name = "Dimitrije Markovic"}]
 license = {text = "MIT"}
 dependencies = [
     "jax=>0.4.38",
-    "optax=>0.2.4"
+    "optax=>0.2.4",
+    "jaxtyping=>0.2.36"
 ]
 readme = "README.md"
 requires-python = ">=3.11"
