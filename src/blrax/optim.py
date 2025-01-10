@@ -15,8 +15,6 @@ from optax import scale_by_learning_rate, chain
 
 from .utils import random_split_like_tree
 
-_abs_sq = numerics.abs_sq
-
 ScalarOrSchedule = Union[float, Array, base.Schedule]
 
 @functools.partial(jax.jit, inline=True)
