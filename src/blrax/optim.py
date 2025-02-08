@@ -1,4 +1,4 @@
-import functools
+from functools import partial
 from typing import Any, NamedTuple, Optional, Union
 
 import chex
@@ -6,55 +6,23 @@ import jax
 import jax.numpy as jnp
 
 from jax import random as jr
-from jaxtyping import Array, PRNGKeyArray
-
 from optax._src import base
 from optax._src import numerics
 from optax._src import utils
-from optax import scale_by_learning_rate, chain
+from optax import scale_by_learning_rate, chain, tree_utils as otu
 
-from .utils import random_split_like_tree
+from blrax.utils import tree_random_like
+from blrax.states import ScaleByIvonState
 
-ScalarOrSchedule = Union[float, Array, base.Schedule]
-
-@functools.partial(jax.jit, inline=True)
-def bias_correction(moment, decay, count):
-  """Performs bias correction. It becomes a no-op as count goes to infinity."""
-  # The conversion to the data type of the moment ensures that bfloat16 remains
-  # bfloat16 in the optimizer state. This conversion has to be done after
-  # `bias_correction_` is calculated as calculating `decay**count` in low
-  # precision can result in it being rounded to 1 and subsequently a
-  # "division by zero" error.
-  bias_correction_ = 1 - decay**count
-
-  # Perform division in the original precision.
-  return jax.tree_util.tree_map(
-    lambda t: t / bias_correction_.astype(t.dtype), moment)
-
-def update_grad(updates, moments, decay):
-  """Compute the exponential moving average of the `order`-th moment."""
-  return jax.tree_util.tree_map(
-      lambda g, t: decay * g  + (1 - decay) * t, updates, moments)
+ScalarOrSchedule = Union[float, chex.Array, base.Schedule]
 
 def update_hessian(moments, updates, decay, delta):
   """Compute the exponential moving average of the hessian while maintaing positivity contraint."""
   func = lambda h, t: decay * h + (1 - decay) * t + .5 * jnp.square( (1 - decay) * (h - t) ) / (h + delta)
-  return jax.tree_util.tree_map(func, moments, updates)
-
-class ScaleByState(NamedTuple):
-  """State for the algorithms."""
-  key: chex.PRNGKey
-  count: chex.Array  # shape=(), dtype=jnp.int32.
-  g: base.Updates
-  h: base.Updates
-  eps: base.Updates
-  num_datapoints: int
-  weight_decay: float
-  sample_params: bool = True
-  
+  return jax.tree_util.tree_map(func, moments, updates)  
 
 def scale_by_ivon(
-    key: PRNGKeyArray,
+    key: chex.PRNGKey,
     s0: float,
     h0: float,
     num_data: int,
@@ -73,6 +41,7 @@ def scale_by_ivon(
     s0: prior precision.
     h0: initial hessian.
     num_data: number of data points.
+    mc_samples: number of monte carlo samples from approximate posterior
     b1: Decay rate for the exponentially weighted average of grads.
     b2: Decay rate for the exponentially weighted average of squared grads.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
@@ -85,46 +54,48 @@ def scale_by_ivon(
   m_dtype = utils.canonicalize_dtype(m_dtype)
   wd = s0 / num_data  # weight decay
 
-  def init_fn(key, params):
-    g = jax.tree_util.tree_map(lambda t:  jnp.zeros_like(t), params)  # Second moment
-    h = jax.tree_util.tree_map(lambda t: h0 * jnp.ones_like(t, dtype=m_dtype), params)  # First moment
-    keys, key = random_split_like_tree(key, target=params)
-    eps = jax.tree_util.tree_map(lambda t, key: jr.normal(key, shape=(mc_samples,) + t.shape), params, keys)
-    return ScaleByState(
-      key=key,
+  def init_fn(rng_key, params):
+    g = otu.tree_zeros_like(params, dtype=m_dtype)  # First moment
+    h = otu.tree_full_like(params, h0, dtype=m_dtype)  # Second moment (hessian)
+    key1, key2 = jr.split(rng_key)
+    eps = tree_random_like(key1, target_tree=params, add_shape=(mc_samples,), sampler=jr.normal)  # noise
+    return ScaleByIvonState(
+      key=key2,
       count=jnp.zeros([], jnp.int32),
       h=h,
       g=g,
       eps=eps,
-      weight_decay=wd,
-      num_datapoints=num_data
-      )
+      num_datapoints=num_data,
+      mc_samples=mc_samples,
+      weight_decay=wd * jnp.ones([])
+    )
 
   def update_fn(updates, state, params):
+    otu.tree_update_moment
     g_bar = jax.tree_util.tree_map(
       lambda g: jnp.mean(g, 0), updates
     )
-    g = update_grad(g_bar, state.g, b1)
+    g = otu.tree_update_moment(g_bar, state.g, 1 - b1, 1.)
     hat_h = jax.tree_util.tree_map(
       lambda g, noise: jnp.mean(noise * g, 0), updates, state.eps
     )
 
     h = update_hessian(state.h, hat_h, b2, wd)
     count_inc = numerics.safe_int32_increment(state.count)
-    g_hat = bias_correction(g, b1, count_inc)
+    g_hat = otu.tree_bias_correction(g, b1, count_inc)
     updates = jax.tree_util.tree_map(
-        lambda m, mu, v: jnp.clip(m + wd * mu, min=-clip_radius, max=clip_radius) / (v + wd), g_hat, params, h)
+        lambda g, mu, h: jnp.clip(g + wd * mu, min=-clip_radius, max=clip_radius) / (h + wd), g_hat, params, h)
     
-    g = utils.cast_tree(g, m_dtype)
+    g = otu.tree_cast(g, m_dtype)
 
-    keys, key = random_split_like_tree(state.key, target=params)
-    eps = jax.tree_util.tree_map(lambda t, key: jr.normal(key, shape=(mc_samples,) + t.shape), params, keys)
-    return updates, ScaleByState(key=key, count=count_inc, g=g, h=h, eps=eps, weight_decay=wd, num_datapoints=num_data)
+    _key, key = jr.split(state.key)
+    eps = tree_random_like(_key, target_tree=params, add_shape=(mc_samples,), sampler=jr.normal)
+    return updates, ScaleByIvonState(key=key, count=count_inc, g=g, h=h, eps=eps, weight_decay=wd, num_datapoints=num_data, mc_samples=mc_samples)
 
-  return base.GradientTransformation(functools.partial(init_fn, key), update_fn)
+  return base.GradientTransformation(partial(init_fn, key), update_fn)
 
 def ivon(
-    key: PRNGKeyArray,
+    key: chex.PRNGKey,
     learning_rate: ScalarOrSchedule,
     s0: float = 1.,
     h0: float = 1.,
@@ -146,7 +117,7 @@ def ivon(
   schedule function.
 
   The ``init`` function of this optimizer initializes an internal state
-  :math:`S_0 := (m_0, h_0) = (0, h0)`, representing initial estimates for the first and second moments. In practice these values are stored as pytrees
+  :math:`S_0 := (g_0, h_0) = (0, h0)`, representing initial estimates for the first and second moments. In practice these values are stored as pytrees
   , with the same shape as the model updates.
   At step :math:`t`, the ``update`` function of this optimizer takes as
   arguments the incoming (sample of) gradients :math:`g_t` and optimizer state :math:`S_t`
@@ -155,13 +126,15 @@ def ivon(
 
   .. math::
     \begin{align*}
-      m_t &\leftarrow m_{t-1} - \alpha_t \cdot ( \bar{g}_t + \delta \mu ) \\
-      s_t &\leftarrow \beta_2 \cdot s_{t-1} + (1-\beta_2) \cdot {g_t}^2 \\
-      \hat{m}_t &\leftarrow m_t / {(1-\beta_1^t)} \\
-      \hat{s}_t &\leftarrow s_t / {(1-\beta_2^t)} \\
-      u_t &\leftarrow \alpha_t \cdot \hat{m}_t / \left({\sqrt{\hat{v}_t +
-      \bar{\varepsilon}} + \tilde{\lambda}} \right)\\
-      S_t &\leftarrow (m_t, s_t).
+      \delta &\leftarrow s0 / N \\
+      \bar{g} &\leftarrow \sum_s g_s / S \\
+      \bar{h} &\leftarrow \sum_s g_s \epsilon_s / S \\
+      g &\leftarrow b1 \cdot g + ( 1 - b1 ) \cdot \bar{g} \\
+      h &\leftarrow \beta_2 \cdot h + (1-\beta_2) \cdot \bar{h} + 0.5 \cdot (1-\beta_2)^2 (h - \bar{h})^2 /(h + \delta) \\
+      \hat{g} &\leftarrow g / {(1-\beta_1^t)} \\
+      mu &\leftarrow mu - \alpha_t \cdot ( \hat{g} + \delta \mu ) / (h + \delta) \\
+      \sigma &\leftarrow 1 / \sqrt{N h + s0} \\
+      S_t &\leftarrow (g_t, h_t).
     \end{align*}
 
   References:
@@ -170,14 +143,13 @@ def ivon(
   Args:
     key: Random number seed.
     learning_rate: A fixed global scaling factor.
-    t_lam: Prior precision devided by the number of data points in the training set.
-    t_init: Initial precision of the variational posterior q devided by the number of data points in the training set.
-    N: Number of data points in the training set.
+    s0: Prior precision.
+    h0: Initial value of the hessian for every parameter
+    num_data: Number of data points in the training set.
+    mc_samples: Number of monte carlo samples from the posterior.
+    clip_radius: Maximal absolute value of the change in the first moment.
     b1: Exponential decay rate to track the first moment of past gradients.
     b2: Exponential decay rate to track the second moment of past gradients.
-    eps_root: A small constant applied to denominator inside the square root (as
-      in RMSProp), to avoid dividing by zero when rescaling. This is needed for
-      example when computing (meta-)gradients through Vadam.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
 
@@ -185,6 +157,6 @@ def ivon(
     The corresponding `GradientTransformation`.
   """
   return chain(
-      scale_by_ivon(key, s0, h0, num_data, mc_samples, b1=b1, b2=b2, m_dtype=m_dtype),
+      scale_by_ivon(key, s0, h0, num_data, mc_samples, clip_radius=clip_radius, b1=b1, b2=b2, m_dtype=m_dtype),
       scale_by_learning_rate(learning_rate),
   )
