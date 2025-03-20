@@ -105,7 +105,7 @@ def noisy_value_and_grad(loss_fn, state, params, *args, key=None, mask=None, **k
         state: optax type state.
         params: PyTree or Array, over which we are computing gradients and values.
         args: Arguments to the loss function
-        key: RNG key to be passed to the loss function
+        key: RNG key to be passed to the loss function. It has to be vmap-able over the number of mc samples.
         mask: PyTree or Array of the same structure as params, used to mask gradients and random samples.
 
     Returns:
@@ -118,13 +118,11 @@ def noisy_value_and_grad(loss_fn, state, params, *args, key=None, mask=None, **k
             loss_value, grads = jax.vmap(
                 jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)))(_params, *args)
         else:
-            n_samples = state.mc_samples  
-            keys = jax.random.split(key, n_samples)
             loss_value, grads = jax.vmap(
-                jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)) + (0,))(_params, *args, key=keys)
+                jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)) + (0,))(_params, *args, key)
 
         loss_value = jax.numpy.mean(loss_value)
     else:
-        loss_value, grads = jax.value_and_grad(loss_fn, **kwargs)(params, *args) if key is None else jax.value_and_grad(loss_fn)(params, *args, key=key)
+        loss_value, grads = jax.value_and_grad(loss_fn, **kwargs)(params, *args) if key is None else jax.value_and_grad(loss_fn)(params, *args, key)
 
     return loss_value, grads
