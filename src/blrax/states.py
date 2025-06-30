@@ -1,14 +1,12 @@
 import chex
-from typing import NamedTuple
-from optax._src import base
+from typing import NamedTuple, Optional
+import optax
 
 class ScaleByIvonState(NamedTuple):
   """State for the algorithm."""
-  key: chex.PRNGKey
-  count: chex.Array  # shape=(), dtype=jnp.int32.
-  g: base.Updates
-  h: base.Updates
-  eps: base.Updates
-  num_datapoints: int
-  mc_samples: int
-  weight_decay: chex.Array # shape=(), dtype=jnp.float32.
+  count: chex.Array  # shape=(), dtype=jnp.int32
+  momentum: optax.Updates
+  hess: optax.Updates
+  ess: chex.Array  # shape=(), dtype=jnp.float32
+  weight_decay: chex.Array # shape=(), dtype=jnp.float32
+  noise: Optional[optax.Updates] = None

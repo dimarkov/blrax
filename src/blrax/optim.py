@@ -1,49 +1,47 @@
-from functools import partial
 from typing import Any, NamedTuple, Optional, Union
 
 import chex
 import jax
+import optax
 import jax.numpy as jnp
 
 from jax import random as jr
-from optax._src import base
-from optax._src import numerics
 from optax._src import utils
-from optax import scale_by_learning_rate, chain, tree_utils as otu
+from optax import tree_utils as otu
 
 from blrax.utils import tree_random_like
 from blrax.states import ScaleByIvonState
 
-ScalarOrSchedule = Union[float, chex.Array, base.Schedule]
+ScalarOrSchedule = Union[float, chex.Array, optax.Schedule]
 
-def update_hessian(moments, updates, decay, delta):
+def update_hessian(hess, bar_hess, ess, decay, delta):
   """Compute the exponential moving average of the hessian while maintaing positivity contraint."""
+  hat_hess = jax.tree_util.tree_map(lambda a, h: ess * a * (h + delta), bar_hess, hess)
+
   func = lambda h, t: decay * h + (1 - decay) * t + .5 * jnp.square( (1 - decay) * (h - t) ) / (h + delta)
-  return jax.tree_util.tree_map(func, moments, updates)  
+  return jax.tree_util.tree_map(func, hess, hat_hess)
 
 def scale_by_ivon(
-    key: chex.PRNGKey,
-    s0: float,
-    h0: float,
-    num_data: int,
-    mc_samples: int = 1,
-    clip_radius: float = jnp.inf,
+    ess: float,
+    hess_init: float,
     b1: float = 0.9,
     b2: float = 0.99999,
+    weight_decay: float = 1e-4,
     m_dtype: Optional[chex.ArrayDType] = None
-) -> base.GradientTransformation:
+) -> optax.GradientTransformation:
   """Rescale updates according to the IVON algorithm.
 
   References:
     [Shen et al, 2024](https://arxiv.org/abs/2402.17641)
 
   Args:
-    s0: prior precision.
-    h0: initial hessian.
-    num_data: number of data points.
-    mc_samples: number of monte carlo samples from approximate posterior
+    key: Random number seed.
+    ess: Effective sample size.
+    hess_init: Initial value of the hessian for every parameter.
+    mc_samples: Number of monte carlo samples from approximate posterior.
     b1: Decay rate for the exponentially weighted average of grads.
     b2: Decay rate for the exponentially weighted average of squared grads.
+    weight_decay: Weight decay coefficient.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
 
@@ -52,60 +50,49 @@ def scale_by_ivon(
   """
 
   m_dtype = utils.canonicalize_dtype(m_dtype)
-  wd = s0 / num_data  # weight decay
-
-  def init_fn(rng_key, params):
-    g = otu.tree_zeros_like(params, dtype=m_dtype)  # First moment
-    h = otu.tree_full_like(params, h0, dtype=m_dtype)  # Second moment (hessian)
-    key1, key2 = jr.split(rng_key)
-    eps = tree_random_like(key1, target_tree=params, add_shape=(mc_samples,), sampler=jr.normal)  # noise
+  def init_fn(params):
+    m = otu.tree_zeros_like(params, dtype=m_dtype)  # First moment
+    h = otu.tree_full_like(params, hess_init, dtype=m_dtype)  # Second moment (hessian)
     return ScaleByIvonState(
-      key=key2,
       count=jnp.zeros([], jnp.int32),
-      h=h,
-      g=g,
-      eps=eps,
-      num_datapoints=num_data,
-      mc_samples=mc_samples,
-      weight_decay=wd * jnp.ones([])
+      momentum=m,
+      hess=h,
+      ess=ess,
+      weight_decay=weight_decay,
     )
 
   def update_fn(updates, state, params):
-    otu.tree_update_moment
-    g_bar = jax.tree_util.tree_map(
-      lambda g: jnp.mean(g, 0), updates
-    )
-    g = otu.tree_update_moment(g_bar, state.g, 1 - b1, 1.)
-    hat_h = jax.tree_util.tree_map(
-      lambda g, noise: jnp.mean(noise * g, 0), updates, state.eps
-    )
-
-    h = update_hessian(state.h, hat_h, b2, wd)
-    count_inc = numerics.safe_int32_increment(state.count)
-    g_hat = otu.tree_bias_correction(g, b1, count_inc)
+    g_bar, h_bar = updates
+    momentum = otu.tree_update_moment(g_bar, state.momentum, b1, 1.)
+    hess = update_hessian(state.hess, h_bar, state.ess, b2, state.weight_decay)
+    count = optax.safe_increment(state.count)
+    bias_correction = 1 - b1**count
     updates = jax.tree_util.tree_map(
-        lambda g, mu, h: jnp.clip(g + wd * mu, min=-clip_radius, max=clip_radius) / (h + wd), g_hat, params, h)
+        lambda m, p, h: (m / bias_correction + state.weight_decay * p) / (h + state.weight_decay), momentum, params, hess)
     
-    g = otu.tree_cast(g, m_dtype)
+    momentum = otu.tree_cast(momentum, m_dtype)
 
-    _key, key = jr.split(state.key)
-    eps = tree_random_like(_key, target_tree=params, add_shape=(mc_samples,), sampler=jr.normal)
-    return updates, ScaleByIvonState(key=key, count=count_inc, g=g, h=h, eps=eps, weight_decay=wd, num_datapoints=num_data, mc_samples=mc_samples)
+    return updates, ScaleByIvonState(
+      count=count, 
+      momentum=momentum, 
+      hess=hess,
+      ess=state.ess, 
+      weight_decay=state.weight_decay
+    )
 
-  return base.GradientTransformation(partial(init_fn, key), update_fn)
+  return optax.GradientTransformation(init_fn, update_fn)
 
 def ivon(
-    key: chex.PRNGKey,
     learning_rate: ScalarOrSchedule,
-    s0: float = 1.,
-    h0: float = 1.,
-    num_data: int = 1e4,
-    mc_samples: int = 1,
-    clip_radius: float = jnp.inf,
+    ess: float = 1.,
+    hess_init: float = 1.,
+    clip_radius: float = float("inf"),
     b1: float = 0.9,
     b2: float = 0.99999,
+    weight_decay: float = 1e-4,
+    rescale_lr: bool = True,
     m_dtype: Optional[Any] = None,
-) -> base.GradientTransformation:
+) -> optax.GradientTransformation:
   r"""The improved variational online Newton (IVON) optimizer.
 
   IVON is a stochastic natural gradient variant with gradient scaling adaptation. The scaling
@@ -141,22 +128,38 @@ def ivon(
     Shen et al, 2024: https://arxiv.org/abs/2402.17641
 
   Args:
-    key: Random number seed.
     learning_rate: A fixed global scaling factor.
-    s0: Prior precision.
-    h0: Initial value of the hessian for every parameter
-    num_data: Number of data points in the training set.
-    mc_samples: Number of monte carlo samples from the posterior.
+    ess: Effective sample size.
+    hess_init: Initial value of the hessian for every parameter.
     clip_radius: Maximal absolute value of the change in the first moment.
     b1: Exponential decay rate to track the first moment of past gradients.
     b2: Exponential decay rate to track the second moment of past gradients.
+    weight_decay: Weight decay coefficient.
+    rescale_lr: Optional bool to switch rescaling of learning rate by a sum of initial hessian and weight decay.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
 
   Returns:
     The corresponding `GradientTransformation`.
   """
-  return chain(
-      scale_by_ivon(key, s0, h0, num_data, mc_samples, clip_radius=clip_radius, b1=b1, b2=b2, m_dtype=m_dtype),
-      scale_by_learning_rate(learning_rate),
-  )
+
+  ivon_trans = scale_by_ivon(ess, hess_init, b1=b1, b2=b2, weight_decay=weight_decay, m_dtype=m_dtype)
+
+  if rescale_lr:
+    lr_scale = (
+      optax.scale_by_learning_rate(learning_rate),
+      optax.scale(hess_init + weight_decay),
+    )
+  else:
+    lr_scale = (optax.scale_by_learning_rate(learning_rate),)
+
+  if clip_radius < float("inf"):
+    transform = optax.chain(
+      ivon_trans,
+      optax.clip(clip_radius),
+      *lr_scale,
+    )
+  else:
+    transform = optax.chain(ivon_trans, *lr_scale)
+
+  return transform
