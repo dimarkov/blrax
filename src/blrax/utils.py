@@ -45,7 +45,7 @@ def tree_random_like(
     distribution ``sampler``.
   """
   keys_tree = tree_split_key_like(rng_key, target_tree)
-  return jax.tree_util.tree_map(
+  return jax.tree.map(
       lambda leaf, key: sampler(key, add_shape + leaf.shape, dtype or leaf.dtype),
       target_tree,
       keys_tree,
@@ -55,7 +55,7 @@ def get_sigma(h, ess, weight_decay):
     return 1 / jax.numpy.sqrt(ess * (h + weight_decay))
 
 def get_scale(state):
-    return jax.tree_util.tree_map(
+    return jax.tree.map(
         lambda v: get_sigma(v, state.ess, state.weight_decay), state.hess
     )
 
@@ -64,11 +64,11 @@ def add_noise_to_params(params, state, mask=None):
     delta = state.weight_decay
 
     if mask is not None:
-        params = jax.tree_util.tree_map(
+        params = jax.tree.map(
             lambda m, h, e, t: m + t * e * get_sigma(h, ess, delta), params, state.hess, state.noise, mask
         )
     else:
-        params = jax.tree_util.tree_map(
+        params = jax.tree.map(
             lambda m, h, e: m + e * get_sigma(h, ess, delta), params, state.hess, state.noise
         )
     
@@ -78,10 +78,10 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     ess = state.ess
     weight_decay = state.weight_decay
 
-    pleaves, paux = jax.tree_util.tree_flatten(params)
-    hleaves = jax.tree_util.tree_flatten(state.hess)[0]
+    pleaves, paux = jax.tree.flatten(params)
+    hleaves = jax.tree.flatten(state.hess)[0]
 
-    mleaves = jax.tree_util.tree_flatten(mask)[0] if mask is not None else [None] * len(pleaves)
+    mleaves = jax.tree.flatten(mask)[0] if mask is not None else [None] * len(pleaves)
     samples = []
     noise = []
     for p, h, m in zip(pleaves, hleaves, mleaves):
@@ -97,24 +97,29 @@ def sample_posterior(key, params, state, shape=(), mask=None):
             n if m is None else jnp.where(m, n, 0.0)
         )
 
-    sampled_params = jax.tree_util.tree_unflatten(paux, samples)
-    noise = jax.tree_util.tree_unflatten(paux, noise)
+    sampled_params = jax.tree.unflatten(paux, samples)
+    noise = jax.tree.unflatten(paux, noise)
 
     return sampled_params, state._replace(noise=noise)
 
+def tree_stack(pytree_list, axis=0):
+    def stack(*args):
+        return jax.numpy.stack(args, axis=axis)
+
+    return jax.tree.map(stack, *pytree_list)
 
 def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
     keys = jax.random.split(key, mc_samples)
 
-    total_loss = 0.0
+    output = []
     for i, rn in enumerate(keys):
         # draw IVON weight posterior sample
         k1, k2 = jax.random.split(rn)
         psample, optstate = sample_posterior(k1, params, state, mask=mask)
 
         # get gradient and loss for this MC sample from
-        loss_value, grad = jax.value_and_grad(loss_fn, **kwargs)(psample, *args, k2)
-        total_loss += loss_value
+        out, grad = jax.value_and_grad(loss_fn, **kwargs)(psample, *args, k2)
+        output.append(out if isinstance(out, tuple) else (out,))
         if i == 0:
             hat_g = grad
             hat_h = jax.tree_util.tree_map(
@@ -130,7 +135,10 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
         hat_g = jax.tree_util.tree_map(lambda g: g / mc_samples, hat_g)
         hat_h = jax.tree_util.tree_map(lambda h: h / mc_samples, hat_h)
 
-    return total_loss / mc_samples, (hat_g, hat_h)
+    output = tree_stack(output, axis=0)
+    output = output[0] if len(output) == 1 else output
+
+    return output, (hat_g, hat_h)
 
 def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
     key, _key = jax.random.split(key)
@@ -139,12 +147,12 @@ def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None,
         jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)) + (0,)
     )
     keys = jax.random.split(key, mc_samples)
-    loss_value, grads = parallel_value_and_grad(sampled_params, *args, keys)
+    out, grads = parallel_value_and_grad(sampled_params, *args, keys)
 
     hat_g = jax.tree_util.tree_map(lambda g: jax.numpy.mean(g, 0), grads)
     hat_h = jax.tree_util.tree_map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
 
-    return jax.numpy.mean(loss_value), (hat_g, hat_h)
+    return out, (hat_g, hat_h)
 
 @eqx.filter_jit
 def noisy_value_and_grad(loss_fn, state, params, key, *args, mc_samples=1, mask=None, method='sequential', **kwargs):
@@ -168,10 +176,10 @@ def noisy_value_and_grad(loss_fn, state, params, key, *args, mc_samples=1, mask=
     """
     if isinstance(state, ScaleByIvonState):
         if method == 'parallel':
-            loss_value, updates = parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
+            out, updates = parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
         else:
-            loss_value, updates = sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
+            out, updates = sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
     else:
-        loss_value, updates = jax.value_and_grad(loss_fn, **kwargs)(params, *args, key)
+        out, updates = jax.value_and_grad(loss_fn, **kwargs)(params, *args, key)
 
-    return loss_value, updates
+    return out, updates

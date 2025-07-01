@@ -27,5 +27,27 @@ class TestOptim(unittest.TestCase):
                 # Test one step
                 updates, state = optimizer.update(updates, state, params)
 
+    def test_ivon_with_aux(self):
+        key = jr.PRNGKey(0)
+        params = {'w': jnp.ones(10), 'b': jnp.ones(1)}
+        def loss_fn(params, *args):
+            return params['w'].sum(), 0.0
+        
+        # Test sequential and parallel variants
+        for mc_samples in [1, 10]:
+            with self.subTest(mc_samples=mc_samples):
+                optimizer = ivon(learning_rate=1e-3)
+                state = optimizer.init(params)
+                out, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='sequential', has_aux=True)
+                
+                assert len(out) == 2
+                # Test one step
+                updates, _ = optimizer.update(updates, state, params)
+
+                out, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='parallel', has_aux=True)
+                assert len(out) == 2
+                # Test one step
+                updates, state = optimizer.update(updates, state, params)
+
 if __name__ == '__main__':
     unittest.main()
