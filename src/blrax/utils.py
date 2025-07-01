@@ -74,7 +74,7 @@ def add_noise_to_params(params, state, mask=None):
     
     return params
 
-def sample_posterior(key, params, state, n_samples=1, mask=None):
+def sample_posterior(key, params, state, shape=(), mask=None):
     ess = state.ess
     weight_decay = state.weight_decay
 
@@ -86,7 +86,7 @@ def sample_posterior(key, params, state, n_samples=1, mask=None):
     noise = []
     for p, h, m in zip(pleaves, hleaves, mleaves):
         key, rng = jax.random.split(key)
-        n = p + jax.random.normal(rng, shape=(n_samples,) + p.shape)
+        n = p + jax.random.normal(rng, shape=shape + p.shape)
         val = p + n * get_sigma(h, ess, weight_decay)
 
         samples.append( 
@@ -100,9 +100,7 @@ def sample_posterior(key, params, state, n_samples=1, mask=None):
     sampled_params = jax.tree_util.tree_unflatten(paux, samples)
     noise = jax.tree_util.tree_unflatten(paux, noise)
 
-    new_state = eqx.tree_at(lambda s: s.noise, state, noise)
-
-    return sampled_params, new_state
+    return sampled_params, state._replace(noise=noise)
 
 
 def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
@@ -112,7 +110,7 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
     for i, rn in enumerate(keys):
         # draw IVON weight posterior sample
         k1, k2 = jax.random.split(rn)
-        psample, optstate = sample_posterior(k1, params, state, n_samples=0, mask=mask)
+        psample, optstate = sample_posterior(k1, params, state, mask=mask)
 
         # get gradient and loss for this MC sample from
         loss_value, grad = jax.value_and_grad(loss_fn, **kwargs)(psample, *args, k2)
@@ -136,7 +134,7 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
 
 def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
     key, _key = jax.random.split(key)
-    sampled_params, state = sample_posterior(_key, params, state, n_samples=mc_samples, mask=mask)
+    sampled_params, state = sample_posterior(_key, params, state, shape=(mc_samples,), mask=mask)
     parallel_value_and_grad = jax.vmap(
         jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)) + (0,)
     )

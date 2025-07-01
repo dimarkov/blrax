@@ -89,7 +89,7 @@ def ivon(
     clip_radius: float = float("inf"),
     b1: float = 0.9,
     b2: float = 0.99999,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 1e-3,
     rescale_lr: bool = True,
     m_dtype: Optional[Any] = None,
 ) -> optax.GradientTransformation:
