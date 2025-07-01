@@ -1,3 +1,4 @@
+from functools import partial
 from typing import Any, NamedTuple, Optional, Union
 
 import chex
@@ -9,17 +10,23 @@ from jax import random as jr
 from optax._src import utils
 from optax import tree_utils as otu
 
-from blrax.utils import tree_random_like
+from blrax.utils import precision
 from blrax.states import ScaleByIvonState
 
 ScalarOrSchedule = Union[float, chex.Array, optax.Schedule]
 
-def update_hessian(hess, bar_hess, ess, decay, delta):
+def update_hessian(hess, bar_hess, ess, decay, wd):
   """Compute the exponential moving average of the hessian while maintaing positivity contraint."""
-  hat_hess = jax.tree_util.tree_map(lambda a, h: ess * a * (h + delta), bar_hess, hess)
+  pi = partial(precision, ess=ess, weight_decay=wd)
 
-  func = lambda h, t: decay * h + (1 - decay) * t + .5 * jnp.square( (1 - decay) * (h - t) ) / (h + delta)
-  return jax.tree_util.tree_map(func, hess, hat_hess)
+  def func(h, _h):
+    t = pi(h) * _h
+    v = decay * h + (1 - decay) * t
+    v += 0.5 * jnp.square( (1 - decay) * (h - t) ) / (h + wd)
+
+    return v
+
+  return jax.tree.map(func, hess, bar_hess)
 
 def scale_by_ivon(
     ess: float,

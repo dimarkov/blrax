@@ -4,75 +4,19 @@ import equinox as eqx
 from collections.abc import Callable
 from typing import Optional
 from blrax.states import ScaleByIvonState
-
-def tree_split_key_like(
-    rng_key: chex.PRNGKey, target_tree: chex.ArrayTree
-) -> chex.ArrayTree:
-  """Split keys to match structure of target tree.
-
-  Args:
-    rng_key: the key to split.
-    target_tree: the tree whose structure to match.
-
-  Returns:
-    a tree of rng keys.
-  """
-  tree_def = jax.tree.structure(target_tree)
-  keys = jax.random.split(rng_key, tree_def.num_leaves)
-  return jax.tree.unflatten(tree_def, keys)
+from jax import lax
 
 
-def tree_random_like(
-    rng_key: chex.PRNGKey,
-    target_tree: chex.ArrayTree,
-    sampler: Callable[
-        [chex.PRNGKey, chex.Shape, chex.ArrayDType], chex.Array
-    ] = jax.random.normal,
-    add_shape: Optional[tuple]=(),
-    dtype: Optional[chex.ArrayDType] = None,
-) -> chex.ArrayTree:
-  """Create tree with random entries of the same shape as target tree.
+def precision(h, ess, weight_decay):
+    return ess * (h + weight_decay)
 
-  Args:
-    rng_key: the key for the random number generator.
-    target_tree: the tree whose structure to match. Leaves must be arrays.
-    sampler: the noise sampling function, by default ``jax.random.normal``.
-    dtype: the desired dtype for the random numbers, passed to ``sampler``. If
-      None, the dtype of the target tree is used if possible.
-
-  Returns:
-    a random tree with the same structure as ``target_tree``, whose leaves have
-    distribution ``sampler``.
-  """
-  keys_tree = tree_split_key_like(rng_key, target_tree)
-  return jax.tree.map(
-      lambda leaf, key: sampler(key, add_shape + leaf.shape, dtype or leaf.dtype),
-      target_tree,
-      keys_tree,
-  )
-
-def get_sigma(h, ess, weight_decay):
-    return 1 / jax.numpy.sqrt(ess * (h + weight_decay))
+def sigma(h, ess, weight_decay):
+    return lax.rsqrt(precision(h, ess, weight_decay))
 
 def get_scale(state):
     return jax.tree.map(
-        lambda v: get_sigma(v, state.ess, state.weight_decay), state.hess
+        lambda v: sigma(v, state.ess, state.weight_decay), state.hess
     )
-
-def add_noise_to_params(params, state, mask=None):
-    ess = state.ess
-    delta = state.weight_decay
-
-    if mask is not None:
-        params = jax.tree.map(
-            lambda m, h, e, t: m + t * e * get_sigma(h, ess, delta), params, state.hess, state.noise, mask
-        )
-    else:
-        params = jax.tree.map(
-            lambda m, h, e: m + e * get_sigma(h, ess, delta), params, state.hess, state.noise
-        )
-    
-    return params
 
 def sample_posterior(key, params, state, shape=(), mask=None):
     ess = state.ess
@@ -87,7 +31,7 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     for p, h, m in zip(pleaves, hleaves, mleaves):
         key, rng = jax.random.split(key)
         n = p + jax.random.normal(rng, shape=shape + p.shape)
-        val = p + n * get_sigma(h, ess, weight_decay)
+        val = p + n * sigma(h, ess, weight_decay)
 
         samples.append( 
             val if m is None else jax.numpy.where(m, val, 0.0)
@@ -122,18 +66,18 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
         output.append(out if isinstance(out, tuple) else (out,))
         if i == 0:
             g_bar = grad
-            h_bar = jax.tree_util.tree_map(
+            h_bar = jax.tree.map(
                 lambda g, n: g * n, grad, optstate.noise
             )
         else:
-            g_bar = jax.tree_util.tree_map(lambda a, g: a + g, g_bar, grad)
-            h_bar = jax.tree_util.tree_map(
+            g_bar = jax.tree.map(lambda a, g: a + g, g_bar, grad)
+            h_bar = jax.tree.map(
                 lambda h, g, n: h + g * n, h_bar, grad, optstate.noise
             )
     
     if mc_samples > 1:
-        g_bar = jax.tree_util.tree_map(lambda g: g / mc_samples, g_bar)
-        h_bar = jax.tree_util.tree_map(lambda h: h / mc_samples, h_bar)
+        g_bar = jax.tree.map(lambda g: g / mc_samples, g_bar)
+        h_bar = jax.tree.map(lambda h: h / mc_samples, h_bar)
 
     output = tree_stack(output, axis=0)
     output = output[0] if len(output) == 1 else output
@@ -149,8 +93,8 @@ def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None,
     keys = jax.random.split(key, mc_samples)
     out, grads = parallel_value_and_grad(sampled_params, *args, keys)
 
-    g_bar = jax.tree_util.tree_map(lambda g: jax.numpy.mean(g, 0), grads)
-    h_bar = jax.tree_util.tree_map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
+    g_bar = jax.tree.map(lambda g: jax.numpy.mean(g, 0), grads)
+    h_bar = jax.tree.map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
 
     return out, g_bar, state._replace(h_bar=h_bar)
 
