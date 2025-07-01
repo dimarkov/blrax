@@ -62,7 +62,8 @@ def scale_by_ivon(
     )
 
   def update_fn(updates, state, params):
-    g_bar, h_bar = updates
+    g_bar = updates
+    h_bar = state.h_bar
     momentum = otu.tree_update_moment(g_bar, state.momentum, b1, 1.)
     hess = update_hessian(state.hess, h_bar, state.ess, b2, state.weight_decay)
     count = optax.safe_increment(state.count)

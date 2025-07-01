@@ -81,7 +81,7 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     pleaves, paux = jax.tree.flatten(params)
     hleaves = jax.tree.flatten(state.hess)[0]
 
-    mleaves = jax.tree.flatten(mask)[0] if mask is not None else [None] * len(pleaves)
+    mleaves = jax.tree.flatten(mask, is_leaf=lambda x: x is None)[0] if mask is not None else [None] * len(pleaves)
     samples = []
     noise = []
     for p, h, m in zip(pleaves, hleaves, mleaves):
@@ -90,11 +90,11 @@ def sample_posterior(key, params, state, shape=(), mask=None):
         val = p + n * get_sigma(h, ess, weight_decay)
 
         samples.append( 
-            val if m is None else jnp.where(m, val, 0.0)
+            val if m is None else jax.numpy.where(m, val, 0.0)
         )
 
         noise.append(
-            n if m is None else jnp.where(m, n, 0.0)
+            n if m is None else jax.numpy.where(m, n, 0.0)
         )
 
     sampled_params = jax.tree.unflatten(paux, samples)
@@ -121,24 +121,24 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
         out, grad = jax.value_and_grad(loss_fn, **kwargs)(psample, *args, k2)
         output.append(out if isinstance(out, tuple) else (out,))
         if i == 0:
-            hat_g = grad
-            hat_h = jax.tree_util.tree_map(
+            g_bar = grad
+            h_bar = jax.tree_util.tree_map(
                 lambda g, n: g * n, grad, optstate.noise
             )
         else:
-            hat_g = jax.tree_util.tree_map(lambda a, g: a + g, hat_g, grad)
-            hat_h = jax.tree_util.tree_map(
-                lambda h, g, n: h + g * n, hat_g, grad, optstate.noise
+            g_bar = jax.tree_util.tree_map(lambda a, g: a + g, g_bar, grad)
+            h_bar = jax.tree_util.tree_map(
+                lambda h, g, n: h + g * n, h_bar, grad, optstate.noise
             )
     
     if mc_samples > 1:
-        hat_g = jax.tree_util.tree_map(lambda g: g / mc_samples, hat_g)
-        hat_h = jax.tree_util.tree_map(lambda h: h / mc_samples, hat_h)
+        g_bar = jax.tree_util.tree_map(lambda g: g / mc_samples, g_bar)
+        h_bar = jax.tree_util.tree_map(lambda h: h / mc_samples, h_bar)
 
     output = tree_stack(output, axis=0)
     output = output[0] if len(output) == 1 else output
 
-    return output, (hat_g, hat_h)
+    return output, g_bar, state._replace(h_bar=h_bar)
 
 def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
     key, _key = jax.random.split(key)
@@ -149,13 +149,13 @@ def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None,
     keys = jax.random.split(key, mc_samples)
     out, grads = parallel_value_and_grad(sampled_params, *args, keys)
 
-    hat_g = jax.tree_util.tree_map(lambda g: jax.numpy.mean(g, 0), grads)
-    hat_h = jax.tree_util.tree_map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
+    g_bar = jax.tree_util.tree_map(lambda g: jax.numpy.mean(g, 0), grads)
+    h_bar = jax.tree_util.tree_map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
 
-    return out, (hat_g, hat_h)
+    return out, g_bar, state._replace(h_bar=h_bar)
 
 @eqx.filter_jit
-def noisy_value_and_grad(loss_fn, state, params, key, *args, mc_samples=1, mask=None, method='sequential', **kwargs):
+def noisy_value_and_grad(loss_fn, opt_state, params, key, *args, mc_samples=1, mask=None, method='sequential', **kwargs):
     """Estimate loss value and gradients. If state has noisy values, they are added
     to the parameters, weighted by posterior scale, and the gradients and values are 
     computed around these monte carlo samples. Only the mean estimate of the loss function
@@ -164,7 +164,7 @@ def noisy_value_and_grad(loss_fn, state, params, key, *args, mc_samples=1, mask=
     Args:
         loss_fn: Function to be differentiated. It should return a scalar (which includes 
         arrays with shape ``()`` but not arrays with shape ``(1,)`` etc.)
-        state: optax type state.
+        opt_state: optax type state.
         params: PyTree or Array, over which we are computing gradients and values.
         args: Arguments to the loss function
         key: RNG key to be passed to the loss function. It has to be vmap-able over the number of mc samples.
@@ -172,14 +172,18 @@ def noisy_value_and_grad(loss_fn, state, params, key, *args, mc_samples=1, mask=
 
     Returns:
         loss_value: Array, 
-        grads: Noisy gradient estimates
+        updates: Gradient estimates
+        state: optax type state.
     """
-    if isinstance(state, ScaleByIvonState):
+    ivon_state = opt_state[0]
+    if isinstance(ivon_state, ScaleByIvonState):
         if method == 'parallel':
-            out, updates = parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
+            out, updates, ivon_state = parallel_sampling(key, loss_fn, params, ivon_state, mc_samples, *args, mask=mask, **kwargs)
         else:
-            out, updates = sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=mask, **kwargs)
+            out, updates, ivon_state = sequential_sampling(key, loss_fn, params, ivon_state, mc_samples, *args, mask=mask, **kwargs)
+        
+        opt_state = (ivon_state,) + opt_state[1:]
     else:
         out, updates = jax.value_and_grad(loss_fn, **kwargs)(params, *args, key)
 
-    return out, updates
+    return out, updates, opt_state

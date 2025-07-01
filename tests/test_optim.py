@@ -17,12 +17,12 @@ class TestOptim(unittest.TestCase):
             with self.subTest(mc_samples=mc_samples):
                 optimizer = ivon(learning_rate=1e-3)
                 state = optimizer.init(params)
-                mean_loss, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='sequential')
+                mean_loss, updates, state = noisy_value_and_grad(loss_fn, state, params, key, mc_samples=mc_samples, method='sequential')
                 
                 # Test one step
                 updates, _ = optimizer.update(updates, state, params)
 
-                mean_loss, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='parallel')
+                mean_loss, updates, state = noisy_value_and_grad(loss_fn, state, params, key, mc_samples=mc_samples, method='parallel')
 
                 # Test one step
                 updates, state = optimizer.update(updates, state, params)
@@ -38,13 +38,13 @@ class TestOptim(unittest.TestCase):
             with self.subTest(mc_samples=mc_samples):
                 optimizer = ivon(learning_rate=1e-3)
                 state = optimizer.init(params)
-                out, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='sequential', has_aux=True)
+                out, updates, state = noisy_value_and_grad(loss_fn, state, params, key, mc_samples=mc_samples, method='sequential', has_aux=True)
                 
                 assert len(out) == 2
                 # Test one step
                 updates, _ = optimizer.update(updates, state, params)
 
-                out, updates = noisy_value_and_grad(loss_fn, state[0], params, key, mc_samples=mc_samples, method='parallel', has_aux=True)
+                out, updates, state = noisy_value_and_grad(loss_fn, state, params, key, mc_samples=mc_samples, method='parallel', has_aux=True)
                 assert len(out) == 2
                 # Test one step
                 updates, state = optimizer.update(updates, state, params)
