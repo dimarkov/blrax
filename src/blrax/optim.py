@@ -53,12 +53,14 @@ def scale_by_ivon(
   def init_fn(params):
     m = otu.tree_zeros_like(params, dtype=m_dtype)  # First moment
     h = otu.tree_full_like(params, hess_init, dtype=m_dtype)  # Second moment (hessian)
+    h_bar = otu.tree_zeros_like(params, dtype=m_dtype)
     return ScaleByIvonState(
       count=jnp.zeros([], jnp.int32),
       momentum=m,
       hess=h,
       ess=ess,
       weight_decay=weight_decay,
+      h_bar=h_bar
     )
 
   def update_fn(updates, state, params):
@@ -78,7 +80,8 @@ def scale_by_ivon(
       momentum=momentum, 
       hess=hess,
       ess=state.ess, 
-      weight_decay=state.weight_decay
+      weight_decay=state.weight_decay,
+      h_bar=otu.tree_zeros_like(h_bar, dtype=m_dtype)
     )
 
   return optax.GradientTransformation(init_fn, update_fn)
