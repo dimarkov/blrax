@@ -23,9 +23,15 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     weight_decay = state.weight_decay
 
     pleaves, paux = jax.tree.flatten(params)
-    hleaves = jax.tree.flatten(state.hess)[0]
+    hleaves = jax.tree.leaves(state.hess)
 
-    mleaves = jax.tree.flatten(mask, is_leaf=lambda x: x is None)[0] if mask is not None else [None] * len(pleaves)
+    if mask is not None:
+        mleaves = jax.tree.leaves(mask)
+        if len(mleaves) < len(pleaves):
+            mleaves = jax.tree.leaves(mask, is_leaf=lambda x: x is None)
+    else:
+        mleaves = [None] * len(pleaves)
+
     samples = []
     noise = []
     for p, h, m in zip(pleaves, hleaves, mleaves):
