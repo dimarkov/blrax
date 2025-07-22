@@ -22,30 +22,32 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     ess = state.ess
     weight_decay = state.weight_decay
 
-    pleaves, paux = jax.tree.flatten(params)
-    hleaves = jax.tree.leaves(state.hess)
+    pleaves, paux = jax.tree.flatten(params, is_leaf=lambda x: x is None)
+    hleaves = jax.tree.leaves(state.hess, is_leaf=lambda x: x is None)
 
     if mask is not None:
-        mleaves = jax.tree.leaves(mask)
-        if len(mleaves) < len(pleaves):
-            mleaves = jax.tree.leaves(mask, is_leaf=lambda x: x is None)
+        mleaves = jax.tree.leaves(mask, is_leaf=lambda x: x is None)
     else:
         mleaves = [None] * len(pleaves)
 
     samples = []
     noise = []
     for p, h, m in zip(pleaves, hleaves, mleaves):
-        key, rng = jax.random.split(key)
-        n = p + jax.random.normal(rng, shape=shape + p.shape)
-        val = p + n * sigma(h, ess, weight_decay)
+        if p is not None:
+            key, rng = jax.random.split(key)
+            n = p + jax.random.normal(rng, shape=shape + p.shape)
+            val = p + n * sigma(h, ess, weight_decay)
 
-        samples.append( 
-            val if m is None else jax.numpy.where(m, val, 0.0)
-        )
+            samples.append( 
+                val if m is None else jax.numpy.where(m, val, 0.0)
+            )
 
-        noise.append(
-            n if m is None else jax.numpy.where(m, n, 0.0)
-        )
+            noise.append(
+                n if m is None else jax.numpy.where(m, n, 0.0)
+            )
+        else:
+            samples.append(None)
+            noise.append(None)
 
     sampled_params = jax.tree.unflatten(paux, samples)
     noise = jax.tree.unflatten(paux, noise)
