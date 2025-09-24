@@ -10,4 +10,3 @@ class ScaleByIvonState(NamedTuple):
   h_bar: optax.Updates
   ess: chex.Array  # shape=(), dtype=jnp.float32
   weight_decay: chex.Array # shape=(), dtype=jnp.float32
-  noise: Optional[optax.Updates] = None
