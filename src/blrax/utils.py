@@ -35,8 +35,8 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     for p, h, m in zip(pleaves, hleaves, mleaves):
         if p is not None:
             key, rng = jax.random.split(key)
-            n = p + jax.random.normal(rng, shape=shape + p.shape)
-            val = p + n * sigma(h, ess, weight_decay)
+            n = sigma(h, ess, weight_decay) * jax.random.normal(rng, shape=shape + p.shape)
+            val = p + n
 
             samples.append( 
                 val if m is None else jax.numpy.where(m, val, 0.0)
@@ -52,7 +52,7 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     sampled_params = jax.tree.unflatten(paux, samples)
     noise = jax.tree.unflatten(paux, noise)
 
-    return sampled_params, state._replace(noise=noise)
+    return sampled_params, noise
 
 def tree_stack(pytree_list, axis=0):
     def stack(*args):
@@ -61,40 +61,32 @@ def tree_stack(pytree_list, axis=0):
     return jax.tree.map(stack, *pytree_list)
 
 def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
-    keys = jax.random.split(key, mc_samples)
+    g_bar_init = jax.tree.map(jax.numpy.zeros_like, params)
+    h_bar_init = jax.tree.map(jax.numpy.zeros_like, params)
 
-    output = []
-    for i, rn in enumerate(keys):
-        # draw IVON weight posterior sample
-        k1, k2 = jax.random.split(rn)
-        psample, optstate = sample_posterior(k1, params, state, mask=mask)
+    def scan_body(carry, _):
+        g_bar, h_bar, rn = carry
+        rn, k1, k2 = jax.random.split(rn, 3)
+        psample, noise = sample_posterior(k1, params, state, mask=mask)
 
-        # get gradient and loss for this MC sample from
         out, grad = jax.value_and_grad(loss_fn, **kwargs)(psample, *args, k2)
-        output.append(out if isinstance(out, tuple) else (out,))
-        if i == 0:
-            g_bar = grad
-            h_bar = jax.tree.map(
-                lambda g, n: g * n, grad, optstate.noise
-            )
-        else:
-            g_bar = jax.tree.map(lambda a, g: a + g, g_bar, grad)
-            h_bar = jax.tree.map(
-                lambda h, g, n: h + g * n, h_bar, grad, optstate.noise
-            )
-    
-    if mc_samples > 1:
-        g_bar = jax.tree.map(lambda g: g / mc_samples, g_bar)
-        h_bar = jax.tree.map(lambda h: h / mc_samples, h_bar)
+        
+        g_bar = jax.tree.map(lambda a, g: a + g / mc_samples, g_bar, grad)
+        h_bar = jax.tree.map(
+            lambda h, g, n: h + g * n / mc_samples, h_bar, grad, noise
+        )
+        
+        # The loss 'out' is the value we want to carry over and stack
+        return (g_bar, h_bar, rn), out
 
-    output = tree_stack(output, axis=0)
-    output = output[0] if len(output) == 1 else output
+    init_carry = (g_bar_init, h_bar_init, key)
+    (g_bar, h_bar, _), output = lax.scan(scan_body, init_carry, jax.numpy.arange(mc_samples))
 
     return output, g_bar, state._replace(h_bar=h_bar)
 
 def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
     key, _key = jax.random.split(key)
-    sampled_params, state = sample_posterior(_key, params, state, shape=(mc_samples,), mask=mask)
+    sampled_params, noise = sample_posterior(_key, params, state, shape=(mc_samples,), mask=mask)
     parallel_value_and_grad = jax.vmap(
         jax.value_and_grad(loss_fn, **kwargs), in_axes=(0,) + tuple([None] * len(args)) + (0,)
     )
@@ -102,7 +94,7 @@ def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None,
     out, grads = parallel_value_and_grad(sampled_params, *args, keys)
 
     g_bar = jax.tree.map(lambda g: jax.numpy.mean(g, 0), grads)
-    h_bar = jax.tree.map(lambda g, n: jax.numpy.mean(g * n, 0), grads, state.noise)
+    h_bar = jax.tree.map(lambda g, n: jax.numpy.mean(g * n, 0), grads, noise)
 
     return out, g_bar, state._replace(h_bar=h_bar)
 
