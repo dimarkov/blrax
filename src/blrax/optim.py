@@ -1,4 +1,3 @@
-from functools import partial
 from typing import Any, NamedTuple, Optional, Union
 
 import chex
@@ -10,23 +9,25 @@ from jax import random as jr
 from optax._src import utils
 from optax import tree_utils as otu
 
-from blrax.utils import precision
 from blrax.states import ScaleByIvonState
 
 ScalarOrSchedule = Union[float, chex.Array, optax.Schedule]
 
-def update_hessian(hess, bar_hess, ess, decay, wd):
-  """Compute the exponential moving average of the hessian while maintaing positivity contraint."""
-  pi = partial(precision, ess=ess, weight_decay=wd)
+def update_hessian(hess, t, decay, wd):
+  """Compute the exponential moving average of the hessian while maintaing positivity contraint.
 
-  def func(h, _h):
-    t = pi(h) * _h
-    v = decay * h + (1 - decay) * t
-    v += 0.5 * jnp.square( (1 - decay) * (h - t) ) / (h + wd)
+  ``t`` is the per-step diagonal-Hessian estimate already expressed in actual
+  Hessian units (the sampling estimators apply the ``pi(h)`` rescaling before
+  calling this; the Hutchinson estimator returns it directly).
+  """
+
+  def func(h, _t):
+    v = decay * h + (1 - decay) * _t
+    v += 0.5 * jnp.square( (1 - decay) * (h - _t) ) / (h + wd)
 
     return v
 
-  return jax.tree.map(func, hess, bar_hess)
+  return jax.tree.map(func, hess, t)
 
 def scale_by_ivon(
     ess: float,
@@ -72,7 +73,7 @@ def scale_by_ivon(
     g_bar = updates
     h_bar = state.h_bar
     momentum = otu.tree_update_moment(g_bar, state.momentum, b1, 1.)
-    hess = update_hessian(state.hess, h_bar, state.ess, b2, state.weight_decay)
+    hess = update_hessian(state.hess, h_bar, b2, state.weight_decay)
     count = optax.safe_increment(state.count)
     bias_correction = 1 - b1**count
     updates = jax.tree_util.tree_map(
@@ -98,7 +99,7 @@ def ivon(
     b1: float = 0.9,
     b2: float = 0.99999,
     weight_decay: float = 1e-4,
-    rescale_lr: bool = True,
+    rescale_lr: bool = False,
     m_dtype: Optional[Any] = None,
 ) -> optax.GradientTransformation:
   r"""The improved variational online Newton (IVON) optimizer.
