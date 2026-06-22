@@ -75,6 +75,22 @@ loss, grads, opt_state = noisy_value_and_grad(
 If your loss returns auxiliary data, pass `has_aux=True`; `mask` (a pytree matching `params`)
 zeroes selected entries in both the gradient and the posterior noise / probe.
 
+### Sparser Hessian estimates (`hess_every`)
+
+The Hessian usually moves slowly, so it need not be re-estimated every step. The `hess_every`
+knob (default `1`) refreshes the Hessian only every `k` steps and reuses the previous estimate
+in between — the gradient is still computed on every step. For the `hutchinson` estimator this
+skips the extra Hessian-vector-product pass on the intervening steps (the gradient at the mean
+is computed alone), which is the bulk of its per-step overhead:
+
+```python
+# estimate the Hessian once every 10 steps
+optim = ivon(learning_rate=1e-1, ess=N, hess_init=1.0, weight_decay=1e-3, hess_every=10)
+```
+
+(The `sampling` estimator derives gradient and Hessian from the same posterior samples, so
+`hess_every` only freezes its Hessian EMA on the skipped steps without a compute saving.)
+
 ## Examples
 * [`examples/test_mnist.ipynb`](examples/test_mnist.ipynb) — IVON on MNIST.
 * [`examples/compare_ivon_estimators.ipynb`](examples/compare_ivon_estimators.ipynb) — sampling vs. Hutchinson.

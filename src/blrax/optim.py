@@ -35,6 +35,7 @@ def scale_by_ivon(
     b1: float = 0.9,
     b2: float = 0.99999,
     weight_decay: float = 1e-4,
+    hess_every: int = 1,
     m_dtype: Optional[chex.ArrayDType] = None
 ) -> optax.GradientTransformation:
   """Rescale updates according to the IVON algorithm.
@@ -48,6 +49,10 @@ def scale_by_ivon(
     b1: Decay rate for the exponentially weighted average of grads.
     b2: Decay rate for the exponentially weighted average of squared grads.
     weight_decay: Weight decay coefficient.
+    hess_every: Refresh the hessian every ``hess_every`` steps (``1`` = every
+      step). On the intervening steps the estimator returns the previous hessian
+      (so the EMA below is an exact no-op) and, for the Hutchinson estimator,
+      skips the extra Hessian-vector-product pass entirely.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
 
@@ -65,26 +70,30 @@ def scale_by_ivon(
       hess=hessian,
       ess=ess,
       weight_decay=weight_decay,
+      hess_every=jnp.asarray(hess_every, jnp.int32),
     )
 
   def update_fn(updates, state, params):
     g_bar = updates
     h_bar = state.h_bar
     momentum = otu.tree_update_moment(g_bar, state.momentum, b1, 1.)
+    # On skipped steps the estimator hands back the previous hessian, so this
+    # EMA reduces to the identity and the hessian is reused unchanged.
     hess = update_hessian(state.hess, h_bar, b2, state.weight_decay)
     count = optax.safe_increment(state.count)
     bias_correction = 1 - b1**count
     updates = jax.tree_util.tree_map(
         lambda m, p, h: (m / bias_correction + state.weight_decay * p) / (h + state.weight_decay), momentum, params, hess)
-    
+
     momentum = otu.tree_cast(momentum, m_dtype)
 
     return updates, ScaleByIvonState(
-      count=count, 
-      momentum=momentum, 
+      count=count,
+      momentum=momentum,
       hess=hess,
-      ess=state.ess, 
+      ess=state.ess,
       weight_decay=state.weight_decay,
+      hess_every=state.hess_every,
     )
 
   return optax.GradientTransformation(init_fn, update_fn)
@@ -97,6 +106,7 @@ def ivon(
     b1: float = 0.9,
     b2: float = 0.99999,
     weight_decay: float = 1e-4,
+    hess_every: int = 1,
     rescale_lr: bool = False,
     m_dtype: Optional[Any] = None,
 ) -> optax.GradientTransformation:
@@ -142,6 +152,10 @@ def ivon(
     b1: Exponential decay rate to track the first moment of past gradients.
     b2: Exponential decay rate to track the second moment of past gradients.
     weight_decay: Weight decay coefficient.
+    hess_every: Estimate the hessian every ``hess_every`` steps (``1`` = every
+      step). Larger values reuse the previous hessian on intervening steps,
+      speeding up the Hutchinson estimator by skipping its extra Hessian-vector
+      product on those steps. The gradient is still computed every step.
     rescale_lr: Optional bool to switch rescaling of learning rate by a sum of initial hessian and weight decay.
     m_dtype: Optional `dtype` to be used for the first order accumulator; if
       `None` then the `dtype` is inferred from `params` and `updates`.
@@ -150,7 +164,7 @@ def ivon(
     The corresponding `GradientTransformation`.
   """
 
-  ivon_trans = scale_by_ivon(ess, hess_init, b1=b1, b2=b2, weight_decay=weight_decay, m_dtype=m_dtype)
+  ivon_trans = scale_by_ivon(ess, hess_init, b1=b1, b2=b2, weight_decay=weight_decay, hess_every=hess_every, m_dtype=m_dtype)
 
   if rescale_lr:
     lr_scale = (

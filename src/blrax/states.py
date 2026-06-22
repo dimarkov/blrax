@@ -9,4 +9,5 @@ class ScaleByIvonState(NamedTuple):
   hess: optax.Updates
   ess: chex.Array  # shape=(), dtype=jnp.float32
   weight_decay: chex.Array # shape=(), dtype=jnp.float32
+  hess_every: chex.Array = 1  # estimate/refresh the hessian every k steps
   h_bar: Optional[optax.Updates] = None

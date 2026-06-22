@@ -129,6 +129,106 @@ class TestOptim(unittest.TestCase):
         self.assertEqual(len(out), 2)
         self.assertEqual(int(out[1]), 3)
 
+    def test_hess_every_freezes_ema_on_skip_steps_hutchinson(self):
+        # hess_every=2: the Hessian EMA advances on even counts (0, 2, ...) and
+        # is reused unchanged on odd counts. The quadratic Hessian is constant
+        # (= diag(a)) so params may stay fixed across steps.
+        key = jr.PRNGKey(0)
+        a = {'w': jnp.array([1., 2., 3., 4.]), 'b': jnp.array([5., 6.])}
+        params = {'w': jnp.array([0.5, -1., 2., 0.]), 'b': jnp.array([1., -2.])}
+
+        def loss_fn(params, *args):
+            return 0.5 * (jnp.sum(a['w'] * params['w'] ** 2)
+                          + jnp.sum(a['b'] * params['b'] ** 2))
+
+        h0, wd, b2 = 2.0, 0.5, 0.5
+        optimizer = ivon(learning_rate=1e-3, hess_init=h0, weight_decay=wd,
+                         b2=b2, hess_every=2)
+        state = optimizer.init(params)
+
+        def ema(h, t):
+            return b2 * h + (1 - b2) * t + 0.5 * ((1 - b2) * (h - t)) ** 2 / (h + wd)
+
+        def step(state):
+            _, upd, state = noisy_value_and_grad(
+                loss_fn, state, params, key, estimator='hutchinson')
+            _, state = optimizer.update(upd, state, params)
+            return state
+
+        state = step(state)  # count 0 -> estimate
+        hess0 = state[0].hess
+        state = step(state)  # count 1 -> skip
+        hess1 = state[0].hess
+        state = step(state)  # count 2 -> estimate
+        hess2 = state[0].hess
+
+        # estimate step advances the EMA exactly
+        self.assertTrue(jnp.allclose(hess0['w'], ema(jnp.full_like(a['w'], h0), a['w'])))
+        # skip step leaves it untouched
+        self.assertTrue(jnp.allclose(hess1['w'], hess0['w']))
+        self.assertTrue(jnp.allclose(hess1['b'], hess0['b']))
+        # next estimate step advances again from the frozen value
+        self.assertTrue(jnp.allclose(hess2['w'], ema(hess0['w'], a['w'])))
+
+    def test_hess_every_skip_step_still_returns_gradient_hutchinson(self):
+        # On a skip step the gradient at the mean is still exact; no Hessian is
+        # produced (the extra HVP pass is skipped).
+        key = jr.PRNGKey(0)
+        a = {'w': jnp.array([1., 2., 3., 4.]), 'b': jnp.array([5., 6.])}
+        params = {'w': jnp.array([0.5, -1., 2., 0.]), 'b': jnp.array([1., -2.])}
+
+        def loss_fn(params, *args):
+            return 0.5 * (jnp.sum(a['w'] * params['w'] ** 2)
+                          + jnp.sum(a['b'] * params['b'] ** 2))
+
+        optimizer = ivon(learning_rate=1e-3, hess_every=2)
+        state = optimizer.init(params)
+        # land on an odd count -> a skip step
+        ivon_state = state[0]._replace(count=jnp.asarray(1, jnp.int32))
+        state = (ivon_state,) + state[1:]
+
+        value, grad, new_state = noisy_value_and_grad(
+            loss_fn, state, params, key, estimator='hutchinson')
+
+        self.assertTrue(jnp.allclose(value, loss_fn(params)))
+        self.assertTrue(jnp.allclose(grad['w'], a['w'] * params['w']))
+        self.assertTrue(jnp.allclose(grad['b'], a['b'] * params['b']))
+        # the skip step reuses the previous hessian (default hess_init=1.0) and
+        # does NOT recompute the true Hessian diag(a)
+        self.assertTrue(jnp.allclose(new_state[0].h_bar['w'], 1.0))
+        self.assertTrue(jnp.allclose(new_state[0].h_bar['b'], 1.0))
+        self.assertFalse(jnp.allclose(new_state[0].h_bar['w'], a['w']))
+
+    def test_hess_every_freezes_ema_on_skip_steps_sampling(self):
+        # The period applies to the sampling estimator too: the EMA advances on
+        # the estimate step and is frozen on the skip step even though a fresh
+        # (different) sample is drawn.
+        a = {'w': jnp.array([1., 2., 3., 4.]), 'b': jnp.array([5., 6.])}
+        params = {'w': jnp.array([0.5, -1., 2., 0.]), 'b': jnp.array([1., -2.])}
+
+        def loss_fn(params, *args):
+            return 0.5 * (jnp.sum(a['w'] * params['w'] ** 2)
+                          + jnp.sum(a['b'] * params['b'] ** 2))
+
+        optimizer = ivon(learning_rate=1e-3, ess=10., hess_init=1.0, hess_every=2)
+        state = optimizer.init(params)
+
+        _, upd, state = noisy_value_and_grad(
+            loss_fn, state, params, jr.PRNGKey(0), method='parallel', mc_samples=4)
+        _, state = optimizer.update(upd, state, params)
+        hess0 = state[0].hess
+
+        _, upd, state = noisy_value_and_grad(
+            loss_fn, state, params, jr.PRNGKey(99), method='parallel', mc_samples=4)
+        _, state = optimizer.update(upd, state, params)
+        hess1 = state[0].hess
+
+        # estimate step moved the EMA off its init...
+        self.assertFalse(jnp.allclose(hess0['w'], 1.0))
+        # ...and the skip step froze it
+        self.assertTrue(jnp.allclose(hess1['w'], hess0['w']))
+        self.assertTrue(jnp.allclose(hess1['b'], hess0['b']))
+
     def test_hutchinson_ignores_mc_samples_and_method(self):
         # mc_samples and method must not affect the hutchinson estimate.
         key = jr.PRNGKey(2)

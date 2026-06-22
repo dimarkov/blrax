@@ -86,6 +86,12 @@ def sequential_sampling(key, loss_fn, params, state, mc_samples, *args, mask=Non
         lambda hb, h: precision(h, state.ess, state.weight_decay) * hb, h_bar, state.hess
     )
 
+    # Outside an estimation step, reuse the previous hessian (frozen EMA).
+    estimate_step = (state.count % state.hess_every) == 0
+    h_bar = jax.tree.map(
+        lambda hb, h: jax.numpy.where(estimate_step, hb, h), h_bar, state.hess
+    )
+
     return output, g_bar, state._replace(h_bar=h_bar)
 
 def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None, **kwargs):
@@ -102,6 +108,12 @@ def parallel_sampling(key, loss_fn, params, state, mc_samples, *args, mask=None,
 
     h_bar = jax.tree.map(
         lambda hb, h: precision(h, state.ess, state.weight_decay) * hb, h_bar, state.hess
+    )
+
+    # Outside an estimation step, reuse the previous hessian (frozen EMA).
+    estimate_step = (state.count % state.hess_every) == 0
+    h_bar = jax.tree.map(
+        lambda hb, h: jax.numpy.where(estimate_step, hb, h), h_bar, state.hess
     )
 
     return out, g_bar, state._replace(h_bar=h_bar)
@@ -139,17 +151,34 @@ def hutchinson_estimator(key, loss_fn, params, state, *args, mask=None, **kwargs
     ``u ⊙ (∇²L·u)`` with one Rademacher probe ``u``; it is already in actual
     Hessian units and stored in ``h_bar`` without ``pi(h)`` rescaling.
 
+    The Hessian is only (re)estimated on steps where ``count`` is a multiple of
+    ``state.hess_every``. On the intervening steps the extra HVP pass is skipped
+    -- only the gradient at the mean is computed -- and the previous hessian is
+    returned so the optimizer's EMA leaves it unchanged.
+
     ``mc_samples`` and the sequential/parallel ``method`` axis do not apply here:
     a single probe is used and the gradient is deterministic at the mean.
     """
     k_probe, k_loss = jax.random.split(key)
-    u = rademacher_like(k_probe, params, mask=mask)
 
     def f(p):
         return loss_fn(p, *args, k_loss)
 
-    (out, grad), (_, hvp) = jax.jvp(jax.value_and_grad(f, **kwargs), (params,), (u,))
-    h_bar = jax.tree.map(lambda ui, hi: ui * hi, u, hvp)
+    def estimate():
+        u = rademacher_like(k_probe, params, mask=mask)
+        (out, grad), (_, hvp) = jax.jvp(jax.value_and_grad(f, **kwargs), (params,), (u,))
+        h_bar = jax.tree.map(lambda ui, hi: ui * hi, u, hvp)
+        return out, grad, h_bar
+
+    def reuse():
+        # Skip the HVP pass: compute only the gradient at the mean and hand back
+        # the previous hessian (the EMA then reduces to the identity).
+        out, grad = jax.value_and_grad(f, **kwargs)(params)
+        h_bar = jax.tree.map(lambda h, g: h.astype(g.dtype), state.hess, grad)
+        return out, grad, h_bar
+
+    estimate_step = (state.count % state.hess_every) == 0
+    out, grad, h_bar = lax.cond(estimate_step, estimate, reuse)
 
     return out, grad, state._replace(h_bar=h_bar)
 
