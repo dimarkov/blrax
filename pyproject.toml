@@ -9,10 +9,14 @@ description = "Bayesian learning rule based optimisation algorithms in Jax"
 authors = [{name = "Dimitrije Markovic"}]
 license = {text = "MIT"}
 dependencies = [
-    "jax>=0.4.38",
+    "jax[cuda]>=0.4.38",
     "optax>=0.2.4",
     "equinox>=0.12.2",
     "chex>=0.1.89",
+    "ipykernel>=7.3.0",
+    "ipywidgets>=8.1.8",
+    "matplotlib>=3.11.0",
+    "seaborn>=0.13.2",
 ]
 readme = "README.md"
 requires-python = ">=3.11"
