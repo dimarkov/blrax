@@ -43,10 +43,8 @@ def scale_by_ivon(
     [Shen et al, 2024](https://arxiv.org/abs/2402.17641)
 
   Args:
-    key: Random number seed.
     ess: Effective sample size.
     hess_init: Initial value of the hessian for every parameter.
-    mc_samples: Number of monte carlo samples from approximate posterior.
     b1: Decay rate for the exponentially weighted average of grads.
     b2: Decay rate for the exponentially weighted average of squared grads.
     weight_decay: Weight decay coefficient.

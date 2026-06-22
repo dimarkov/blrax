@@ -167,6 +167,8 @@ def noisy_value_and_grad(loss_fn, opt_state, params, key, *args, mc_samples=1, m
         params: PyTree or Array, over which we are computing gradients and values.
         args: Arguments to the loss function
         key: RNG key to be passed to the loss function. It has to be vmap-able over the number of mc samples.
+        mc_samples: Number of posterior samples drawn for ``estimator='sampling'``;
+          ignored when ``estimator='hutchinson'`` (a single Rademacher probe is used).
         mask: PyTree or Array of the same structure as params, used to mask gradients and random samples.
         method: For ``estimator='sampling'``, selects how the monte carlo samples are
           drawn: ``'sequential'`` (scan) or ``'parallel'`` (vmap).
