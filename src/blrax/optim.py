@@ -257,18 +257,24 @@ def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
                                  H=H, G_bar=G_bar, noise=None)
 
 
-def _make_leaf(p, hess_init, max_precond_dim, one_sided):
-    """Static per-leaf construction from the parameter array ``p``."""
+def _make_leaf(p, hess_init, max_precond_dim, one_sided, m_dtype=None):
+    """Static per-leaf construction from the parameter array ``p``.
+
+    The first-moment accumulator ``G_bar`` is stored in ``m_dtype`` (falling
+    back to ``p.dtype``); the Hessian and the eigenbasis factors stay in
+    ``p.dtype`` (the eigenbasis refresh runs in float32 regardless).
+    """
+    g_dtype = m_dtype if m_dtype is not None else p.dtype
     if p.ndim < 2:
         return DiagEvonLeaf(H=jnp.full(p.shape, hess_init, p.dtype),
-                            G_bar=jnp.zeros(p.shape, p.dtype))
+                            G_bar=jnp.zeros(p.shape, g_dtype))
     d = math.prod(p.shape[:-1])
     o = p.shape[-1]
     left_ok = d <= max_precond_dim
     right_ok = o <= max_precond_dim
     if not left_ok and not right_ok:
         return DiagEvonLeaf(H=jnp.full(p.shape, hess_init, p.dtype),
-                            G_bar=jnp.zeros(p.shape, p.dtype))
+                            G_bar=jnp.zeros(p.shape, g_dtype))
     if one_sided and left_ok and right_ok:
         # keep only the smaller axis (on a tie d == o either side is equally
         # cheap; we keep the left one)
@@ -282,7 +288,7 @@ def _make_leaf(p, hess_init, max_precond_dim, one_sided):
     QR = jnp.eye(o, dtype=p.dtype) if right_ok else None
     return MatrixEvonLeaf(L=L, R=R, QL=QL, QR=QR,
                           H=jnp.full((d, o), hess_init, p.dtype),
-                          G_bar=jnp.zeros((d, o), p.dtype))
+                          G_bar=jnp.zeros((d, o), g_dtype))
 
 
 def scale_by_evon(
@@ -303,7 +309,8 @@ def scale_by_evon(
     def init_fn(params):
         leaves = jax.tree.map(
             functools.partial(_make_leaf, hess_init=hess_init,
-                              max_precond_dim=max_precond_dim, one_sided=one_sided),
+                              max_precond_dim=max_precond_dim, one_sided=one_sided,
+                              m_dtype=m_dtype),
             params,
         )
         return ScaleByEvonState(
@@ -329,6 +336,10 @@ def scale_by_evon(
             else:
                 delta, s_new = _update_diag_leaf(
                     g, p, s, state.ess, state.weight_decay, b1, b2)
+            # keep the first-moment accumulator in m_dtype (computed in the
+            # promoted dtype above); mirrors IVON's momentum cast.
+            if m_dtype is not None:
+                s_new = s_new._replace(G_bar=s_new.G_bar.astype(m_dtype))
             new_updates.append(delta)
             new_s.append(s_new)
 

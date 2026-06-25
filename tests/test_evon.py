@@ -274,6 +274,21 @@ class TestEvonUpdate(unittest.TestCase):
                                    jnp.zeros(4), noise, ess, wd, b1, b2)
         self.assertTrue(jnp.allclose(updates['w'], U))
 
+    def test_m_dtype_controls_momentum_accumulator(self):
+        # m_dtype sets the G_bar accumulator dtype at init and after an update;
+        # H and the eigenbasis factors stay in the parameter dtype.
+        params = {'w': jnp.ones((4, 3)), 'b': jnp.ones(3)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100,
+                           m_dtype=jnp.bfloat16)
+        state = self._set_noise(tx.init(params))
+        for leaf in jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf):
+            self.assertEqual(leaf.G_bar.dtype, jnp.bfloat16)
+            self.assertEqual(leaf.H.dtype, jnp.float32)   # stays param dtype
+        grads = {'w': jnp.ones((4, 3)) * 0.2, 'b': jnp.ones(3) * 0.1}
+        _, new_state = tx.update(grads, state, params)
+        for leaf in jax.tree.leaves(new_state.leaves, is_leaf=_is_evon_leaf):
+            self.assertEqual(leaf.G_bar.dtype, jnp.bfloat16)
+
 
 class TestEvonSampler(unittest.TestCase):
     def test_sample_leaves_shapes_and_noise(self):
