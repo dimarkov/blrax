@@ -13,6 +13,8 @@ pip install .
 
 ## Implemented algorithms
 * [Improved Variational Online Newton (IVON)](https://github.com/team-approx-bayes/ivon)
+* [Eigenspace Variational Online Newton (EVON)](https://arxiv.org/abs/2606.23357) — IVON run in
+  SOAP's eigenbasis, giving a structured (non-diagonal) Gaussian posterior.
 
 ## Usage
 
@@ -90,6 +92,37 @@ optim = ivon(learning_rate=1e-1, ess=N, hess_init=1.0, weight_decay=1e-3, hess_e
 
 (The `sampling` estimator derives gradient and Hessian from the same posterior samples, so
 `hess_every` only freezes its Hessian EMA on the skipped steps without a compute saving.)
+
+### EVON
+
+EVON fits a non-diagonal Gaussian posterior `N(vec(M), (Q_R⊗Q_L) diag(vec(V)) (Q_R⊗Q_L)ᵀ)` per
+2-D weight matrix — IVON run inside [SOAP](https://arxiv.org/abs/2409.11321)'s eigenbasis. The
+training loop is identical to IVON; only the optimizer changes:
+
+```python
+from blrax import evon, noisy_value_and_grad, sample_posterior, get_scale
+
+optim = evon(learning_rate=1e-1, ess=N, hess_init=1.0, weight_decay=1e-3,
+             precond_every=10, max_precond_dim=10000, one_sided=False)
+opt_state = optim.init(params)
+
+@jax.jit
+def step(params, opt_state, key, x, y):
+    key, k = jr.split(key)
+    loss, grads, opt_state = noisy_value_and_grad(loss_fn, opt_state, params, k, x, y)
+    updates, opt_state = optim.update(grads, opt_state, params)
+    return optax.apply_updates(params, updates), opt_state, loss
+
+# test-time Bayesian model averaging: draw weight matrices from the structured posterior
+models = sample_posterior(key, params, opt_state[0], shape=(num_mc,))
+# per-parameter marginal std (drops correlations; use sampling for the full posterior)
+std = get_scale(opt_state[0])
+```
+
+Knobs beyond IVON's: `b3` (preconditioner EMA decay), `precond_every` (eigenbasis refresh
+period), `max_precond_dim` (axes larger than this are left diagonal), `one_sided` (precondition
+only the smaller axis of each matrix). 1-D parameters (biases, norms) fall back to diagonal IVON
+automatically.
 
 ## Examples
 * [`examples/test_mnist.ipynb`](examples/test_mnist.ipynb) — IVON on MNIST.
