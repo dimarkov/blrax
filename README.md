@@ -13,7 +13,7 @@ pip install .
 
 ## Implemented algorithms
 * [Improved Variational Online Newton (IVON)](https://github.com/team-approx-bayes/ivon)
-* [Eigenspace Variational Online Newton (EVON)](https://arxiv.org/abs/2606.23357) — IVON run in
+* [Eigenspace Variational Online Newton (EVON)](https://arxiv.org/html/2606.23357v1) — IVON run in
   SOAP's eigenbasis, giving a structured (non-diagonal) Gaussian posterior.
 
 ## Usage
