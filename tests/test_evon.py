@@ -399,9 +399,12 @@ class TestEvonIntegration(unittest.TestCase):
                                                    jr.PRNGKey(c), jnp.zeros(1), jnp.zeros(1))
             _, state = tx.update(grads, state, params)
             return state
-        # count 1..4 -> no refresh, QL stays identity; count 5 -> refresh (eigh)
-        s = one_step(params, tx.init(params), 0)
-        self.assertTrue(jnp.allclose(s[0].leaves['w'].QL, jnp.eye(4)))
+        # post-increment count in 1..4 -> no refresh, QL stays identity;
+        # post-increment count 5 -> refresh (eigh). one_step sets count to c,
+        # then update increments it to c+1 before the refresh gate is checked.
+        for c in (0, 3):   # -> post-increment counts 1 and 4, both no-refresh
+            s = one_step(params, tx.init(params), c)
+            self.assertTrue(jnp.allclose(s[0].leaves['w'].QL, jnp.eye(4)))
         s = one_step(params, tx.init(params), 4)   # update increments to 5 -> refresh
         self.assertFalse(jnp.allclose(s[0].leaves['w'].QL, jnp.eye(4)))
 
