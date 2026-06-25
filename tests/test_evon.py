@@ -9,6 +9,7 @@ from blrax.states import (
 )
 from blrax.utils import _project, _project_back, precision
 from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian, evon
+from blrax.utils import noisy_value_and_grad, _evon_sample_leaves
 
 
 class TestEvonState(unittest.TestCase):
@@ -271,3 +272,43 @@ class TestEvonUpdate(unittest.TestCase):
         U, _, _ = _ref_diag_update(grads['w'], params['w'], jnp.ones(4),
                                    jnp.zeros(4), noise, ess, wd, b1, b2)
         self.assertTrue(jnp.allclose(updates['w'], U))
+
+
+class TestEvonSampler(unittest.TestCase):
+    def test_sample_leaves_shapes_and_noise(self):
+        params = {'w': jnp.zeros((4, 3)), 'b': jnp.zeros(3)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        samples, noises = _evon_sample_leaves(jr.PRNGKey(0), params, state)
+        self.assertEqual(samples['w'].shape, (4, 3))
+        self.assertEqual(len(noises), 2)
+        self.assertEqual(noises[1].shape, (4, 3))   # E for 'w' in the eigenbasis (JAX sorts dict keys: b < w)
+
+    def test_sample_leaves_identity_basis_is_diagonal_draw(self):
+        # at init QL=QR=I, so the matrix draw equals M + E elementwise
+        params = {'w': jnp.full((4, 3), 5.0)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        samples, noises = _evon_sample_leaves(jr.PRNGKey(1), params, state)
+        self.assertTrue(jnp.allclose(samples['w'], 5.0 + noises[0], atol=1e-6))
+
+    def test_noisy_value_and_grad_dispatches_to_evon(self):
+        params = {'w': jnp.ones((4, 3)), 'b': jnp.ones(3)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        state = (tx.init(params),)   # tuple state like optax.chain
+        def loss_fn(p, *args):
+            return p['w'].sum() + p['b'].sum()
+        out, grads, new_state = noisy_value_and_grad(loss_fn, state, params, jr.PRNGKey(2))
+        self.assertEqual(grads['w'].shape, (4, 3))
+        # noise was stashed
+        stashed = jax.tree.leaves(new_state[0].leaves, is_leaf=_is_evon_leaf)[0].noise
+        self.assertIsNotNone(stashed)
+
+    def test_posterior_sample_mean_is_M(self):
+        # many draws around M -> empirical mean close to M
+        params = {'w': jnp.full((3, 2), 1.0)}
+        tx = scale_by_evon(ess=2., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        samples, _ = _evon_sample_leaves(jr.PRNGKey(3), params, state, shape=(4000,))
+        self.assertEqual(samples['w'].shape, (4000, 3, 2))
+        self.assertTrue(jnp.allclose(samples['w'].mean(0), 1.0, atol=0.05))

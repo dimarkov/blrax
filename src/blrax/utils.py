@@ -3,7 +3,7 @@ import chex
 import equinox as eqx
 from collections.abc import Callable
 from typing import Optional
-from blrax.states import ScaleByIvonState
+from blrax.states import ScaleByIvonState, ScaleByEvonState, MatrixEvonLeaf, DiagEvonLeaf, _is_evon_leaf
 from jax import lax
 
 
@@ -71,6 +71,44 @@ def sample_posterior(key, params, state, shape=(), mask=None):
     noise = jax.tree.unflatten(paux, noise)
 
     return sampled_params, noise
+
+def _evon_sample_leaves(key, params, state, shape=(), mask=None):
+    p_leaves, treedef = jax.tree.flatten(params)
+    s_leaves = jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf)
+    if mask is not None:
+        m_leaves = treedef.flatten_up_to(mask)
+    else:
+        m_leaves = [None] * len(p_leaves)
+
+    samples, noises = [], []
+    for p, s, m in zip(p_leaves, s_leaves, m_leaves):
+        key, rk = jax.random.split(key)
+        V = 1.0 / (state.ess * (s.H + state.weight_decay))   # eigenbasis variance
+        E = jax.numpy.sqrt(V) * jax.random.normal(rk, shape + s.H.shape, p.dtype)
+        if isinstance(s, MatrixEvonLeaf):
+            pert = _project_back(s.QL, s.QR, E).reshape(shape + p.shape)
+        else:
+            pert = E.reshape(shape + p.shape)
+        if m is not None:
+            pert = jax.numpy.where(m, pert, 0.0)
+        samples.append(p + pert)
+        noises.append(E)
+    return jax.tree.unflatten(treedef, samples), noises
+
+
+def evon_sample_and_grad(key, loss_fn, params, state, *args, mask=None, **kwargs):
+    k_sample, k_loss = jax.random.split(key)
+    samples, noises = _evon_sample_leaves(k_sample, params, state, mask=mask)
+    out, grads = jax.value_and_grad(loss_fn, **kwargs)(samples, *args, k_loss)
+
+    # stash transient noise back onto each leaf, in flattened order
+    s_leaves = jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf)
+    new_leaves = [s._replace(noise=n) for s, n in zip(s_leaves, noises)]
+    # rebuild the leaves pytree using the params treedef (same structure)
+    _, treedef = jax.tree.flatten(params)
+    leaves = jax.tree.unflatten(treedef, new_leaves)
+    return out, grads, state._replace(leaves=leaves)
+
 
 def tree_stack(pytree_list, axis=0):
     def stack(*args):
@@ -230,14 +268,17 @@ def noisy_value_and_grad(loss_fn, opt_state, params, key, *args, mc_samples=1, m
         state: optax type state.
     """
     ivon_state = opt_state[0]
-    if isinstance(ivon_state, ScaleByIvonState):
+    if isinstance(ivon_state, ScaleByEvonState):
+        out, updates, ivon_state = evon_sample_and_grad(
+            key, loss_fn, params, ivon_state, *args, mask=mask, **kwargs)
+        opt_state = (ivon_state,) + opt_state[1:]
+    elif isinstance(ivon_state, ScaleByIvonState):
         if estimator == 'hutchinson':
             out, updates, ivon_state = hutchinson_estimator(key, loss_fn, params, ivon_state, *args, mask=mask, **kwargs)
         elif method == 'parallel':
             out, updates, ivon_state = parallel_sampling(key, loss_fn, params, ivon_state, mc_samples, *args, mask=mask, **kwargs)
         else:
             out, updates, ivon_state = sequential_sampling(key, loss_fn, params, ivon_state, mc_samples, *args, mask=mask, **kwargs)
-
         opt_state = (ivon_state,) + opt_state[1:]
     else:
         out, updates = jax.value_and_grad(loss_fn, **kwargs)(params, *args, key)
