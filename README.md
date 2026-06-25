@@ -127,6 +127,7 @@ automatically.
 ## Examples
 * [`examples/test_mnist.ipynb`](examples/test_mnist.ipynb) — IVON on MNIST.
 * [`examples/compare_ivon_estimators.ipynb`](examples/compare_ivon_estimators.ipynb) — sampling vs. Hutchinson.
+* [`examples/compare_ivon_evon.ipynb`](examples/compare_ivon_evon.ipynb) — IVON vs. EVON (accuracy, calibration, Bayesian model averaging, cost).
 * [`examples/tune_ivon.py`](examples/tune_ivon.py) — Optuna hyper-parameter search (validation NLL).
 
 ### TODO
