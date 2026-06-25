@@ -339,3 +339,144 @@ class TestEvonPosterior(unittest.TestCase):
         samples, _ = _evon_sample_leaves(jr.PRNGKey(3), params, state, shape=(20000,))
         emp = samples['w'].std(0)
         self.assertTrue(jnp.allclose(scale['w'], emp, atol=0.05))
+
+
+class TestEvonIntegration(unittest.TestCase):
+    def _train(self, tx, params, loss_fn, X, y, key, steps):
+        state = tx.init(params)
+        @jax.jit
+        def step(params, state, key):
+            key, k = jr.split(key)
+            loss, grads, state = noisy_value_and_grad(loss_fn, state, params, k, X, y)
+            updates, state = tx.update(grads, state, params)
+            return optax.apply_updates(params, updates), state, key, loss
+        losses = []
+        for _ in range(steps):
+            params, state, key, loss = step(params, state, key)
+            losses.append(float(loss))
+        return params, state, losses
+
+    def test_end_to_end_linear_regression_converges(self):
+        key = jr.PRNGKey(0)
+        kx, kw, kp = jr.split(key, 3)
+        X = jr.normal(kx, (64, 5))
+        w_true = jr.normal(kw, (5, 1))
+        y = X @ w_true
+        params = {'w': jr.normal(kp, (5, 1)) * 0.1}
+        def loss_fn(p, X, y, key):
+            return jnp.mean((X @ p['w'] - y) ** 2)
+        tx = evon(1e-1, ess=64., hess_init=1.0, max_precond_dim=100, precond_every=5)
+        params, state, losses = self._train(tx, params, loss_fn, X, y, jr.PRNGKey(1), 300)
+        self.assertLess(losses[-1], losses[0])
+        self.assertTrue(losses[-1] < 0.5)
+        self.assertTrue(all(map(lambda v: v == v, losses)))  # no NaNs
+
+    def test_mixed_pytree_with_highrank_and_wide_leaf_jits(self):
+        params = {
+            'w': jnp.ones((6, 4)),
+            'b': jnp.ones(4),
+            'k': jnp.ones((2, 3, 4)),     # >2-D -> reshape (6,4)
+            'wide': jnp.ones((3, 40)),    # right axis over cutoff -> one-sided
+        }
+        def loss_fn(p, key):
+            return sum(jnp.sum(v ** 2) for v in jax.tree.leaves(p))
+        tx = evon(1e-2, ess=10., hess_init=1.0, max_precond_dim=8, precond_every=3)
+        params, state, losses = self._train(
+            tx, params,
+            lambda p, X, y, key: loss_fn(p, key),
+            jnp.zeros(1), jnp.zeros(1), jr.PRNGKey(2), 20)
+        self.assertTrue(all(v == v for v in losses))
+
+    def test_precond_every_gates_basis_refresh(self):
+        params = {'w': jnp.ones((4, 3))}
+        def loss_fn(p, X, y, key):
+            return jnp.sum((p['w'] - 0.5) ** 2)
+        tx = evon(1e-2, ess=10., hess_init=1.0, max_precond_dim=100, precond_every=5)
+        def one_step(params, state, c):
+            inner = state[0]._replace(count=jnp.asarray(c, jnp.int32))
+            state = (inner,) + state[1:]
+            _, grads, state = noisy_value_and_grad(loss_fn, state, params,
+                                                   jr.PRNGKey(c), jnp.zeros(1), jnp.zeros(1))
+            _, state = tx.update(grads, state, params)
+            return state
+        # count 1..4 -> no refresh, QL stays identity; count 5 -> refresh (eigh)
+        s = one_step(params, tx.init(params), 0)
+        self.assertTrue(jnp.allclose(s[0].leaves['w'].QL, jnp.eye(4)))
+        s = one_step(params, tx.init(params), 4)   # update increments to 5 -> refresh
+        self.assertFalse(jnp.allclose(s[0].leaves['w'].QL, jnp.eye(4)))
+
+    def test_structured_posterior_beats_diagonal_on_logistic(self):
+        # Corollary 1 (qualitative): EVON's covariance is closer to the exact
+        # full-Gaussian Laplace covariance than IVON's diagonal one.
+        from jax import hessian
+        key = jr.PRNGKey(0)
+        n, dext = 80, 6
+        X = jr.normal(key, (n, dext))
+        w_star = jr.normal(jr.PRNGKey(1), (dext,))
+        probs = jax.nn.sigmoid(X @ w_star)
+        y = (jr.uniform(jr.PRNGKey(2), (n,)) < probs).astype(jnp.float32)
+
+        def nll(w):
+            z = X @ w
+            return jnp.sum(jax.nn.softplus(z) - y * z) + 0.5 * jnp.sum(w ** 2)
+
+        # Refine the MAP point with a few Newton steps so the Laplace covariance
+        # is evaluated at the true mode (fair comparison point).
+        def newton_step(w):
+            g = jax.grad(nll)(w)
+            Hm = hessian(nll)(w)
+            return w - jnp.linalg.solve(Hm, g)
+        w_map = w_star
+        for _ in range(25):
+            w_map = newton_step(w_map)
+        Sigma_full = jnp.linalg.inv(hessian(nll)(w_map))
+
+        # EVON on the same problem; structured covariance = QL diag(V) QL^T (o=1)
+        params = {'w': jnp.zeros((dext, 1))}
+        def loss_fn(p, X, y, key):
+            z = (X @ p['w'])[:, 0]
+            return jnp.sum(jax.nn.softplus(z) - y * z)
+        tx = evon(5e-2, ess=1.0, hess_init=1.0, weight_decay=1.0,
+                  max_precond_dim=100, precond_every=5, one_sided=False)
+        params, state, _ = self._train(tx, params, loss_fn, X, y, jr.PRNGKey(3), 800)
+        leaf = state[0].leaves['w']
+        V = 1.0 / (state[0].ess * (leaf.H + state[0].weight_decay))   # (dext, 1)
+        Sigma_evon = leaf.QL @ (V[:, 0][:, None] * leaf.QL.T)         # (dext, dext)
+        Sigma_diag = jnp.diag(V[:, 0])                                # IVON-style diagonal
+
+        err_evon = jnp.linalg.norm(Sigma_evon - Sigma_full)
+        err_diag = jnp.linalg.norm(Sigma_diag - Sigma_full)
+        self.assertLess(float(err_evon), float(err_diag))
+
+
+class TestEvonCoverage(unittest.TestCase):
+    def test_sample_leaves_mask_reverts_to_mean(self):
+        params = {'w': jnp.full((4, 3), 7.0)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        mask = {'w': jnp.zeros((4, 3), bool).at[:2].set(True)}  # perturb only rows 0,1
+        samples, _ = _evon_sample_leaves(jr.PRNGKey(0), params, state, mask=mask)
+        # masked-out rows (2:) revert exactly to the mean
+        self.assertTrue(jnp.allclose(samples['w'][2:], 7.0))
+        # unmasked rows are perturbed away from the mean (w.h.p.)
+        self.assertFalse(jnp.allclose(samples['w'][:2], 7.0))
+
+    def test_get_scale_one_sided_matches_empirical(self):
+        # right side None: covariance mixes only along the left axis
+        QL, _ = jnp.linalg.qr(jr.normal(jr.PRNGKey(0), (3, 3)))
+        H = jnp.array([[1.0, 4.0], [2.0, 3.0], [5.0, 1.0]])
+        leaf = MatrixEvonLeaf(L=jnp.eye(3), R=None, QL=QL, QR=None,
+                              H=H, G_bar=jnp.zeros((3, 2)))
+        state = ScaleByEvonState(count=jnp.zeros([], jnp.int32), ess=2.0,
+                                 weight_decay=0.5, precond_every=10, leaves={'w': leaf})
+        params = {'w': jnp.zeros((3, 2))}
+        samples, _ = _evon_sample_leaves(jr.PRNGKey(1), params, state, shape=(20000,))
+        self.assertTrue(jnp.allclose(get_scale(state)['w'], samples['w'].std(0), atol=0.05))
+
+    def test_get_scale_diag_leaf(self):
+        H = jnp.array([1.0, 2.0, 3.0])
+        leaf = DiagEvonLeaf(H=H, G_bar=jnp.zeros(3))
+        state = ScaleByEvonState(count=jnp.zeros([], jnp.int32), ess=2.0,
+                                 weight_decay=0.5, precond_every=10, leaves={'b': leaf})
+        expected = jnp.sqrt(1.0 / (2.0 * (H + 0.5)))
+        self.assertTrue(jnp.allclose(get_scale(state)['b'], expected, atol=1e-6))
