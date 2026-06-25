@@ -186,28 +186,30 @@ class TestEvonLeafUpdate(unittest.TestCase):
         self.assertTrue(jnp.allclose(new.G_bar, G2, atol=1e-6))
         self.assertIsNone(new.noise)
 
-    def test_refresh_makes_orthonormal_basis_and_is_isometry(self):
-        # build a leaf with a non-trivial L; trigger a first refresh (eigh)
-        key = jr.PRNGKey(0)
-        A = jr.normal(key, (4, 4))
-        L = A @ A.T + jnp.eye(4)         # SPD
-        leaf = MatrixEvonLeaf(L=L, R=None, QL=jnp.eye(4), QR=None,
+    def test_refresh_rotates_momentum_preserving_represented_object(self):
+        # Non-identity OLD basis so the rotation (QL_new^T @ QL_old) is genuinely
+        # exercised: a missing or transposed rotation would change Q_L G_bar.
+        QL_old, _ = jnp.linalg.qr(jr.normal(jr.PRNGKey(5), (4, 4)))
+        A = jr.normal(jr.PRNGKey(0), (4, 4))
+        L = A @ A.T + jnp.eye(4)         # SPD -> non-trivial refreshed basis
+        leaf = MatrixEvonLeaf(L=L, R=None, QL=QL_old, QR=None,
                               H=jnp.ones((4, 3)), G_bar=jr.normal(jr.PRNGKey(1), (4, 3)),
                               noise=jnp.zeros((4, 3)))
         g = jr.normal(jr.PRNGKey(2), (4, 3))
         p = jnp.zeros((4, 3))
         old_repr = leaf.QL @ leaf.G_bar          # left-only: Q_L Ḡ (right identity)
-        # count == precond_every triggers the first (eigh) refresh
-        # b1=1.0: pure-rotation test (no EMA mixing) so the isometry is exact
+        # count == precond_every triggers the first (eigh) refresh.
+        # b1=1.0: no EMA mixing, so the only transform on G_bar is the rotation.
         _, new = _update_matrix_leaf(g, p, leaf, 10., 0.5, 1.0, 0.5, 0.95,
                                      count=jnp.asarray(10, jnp.int32),
                                      precond_every=jnp.asarray(10, jnp.int32))
-        # QL stays orthonormal
+        # refreshed basis is orthonormal and actually changed
         self.assertTrue(jnp.allclose(new.QL.T @ new.QL, jnp.eye(4), atol=1e-5))
-        # momentum rotation is an isometry of the represented object Q_L Ḡ
+        self.assertFalse(jnp.allclose(new.QL, QL_old, atol=1e-3))
+        # the rotation preserves the represented object Q_L Ḡ exactly: this fails
+        # for a missing rotation (new_repr = QL_new @ G_bar) or a wrong one.
         new_repr = new.QL @ new.G_bar
-        self.assertTrue(jnp.allclose(jnp.linalg.norm(new_repr),
-                                     jnp.linalg.norm(old_repr), atol=1e-4))
+        self.assertTrue(jnp.allclose(new_repr, old_repr, atol=1e-4))
 
     def test_no_refresh_leaves_basis_unchanged(self):
         leaf = MatrixEvonLeaf(L=jnp.eye(3) * 2, R=None, QL=jnp.eye(3), QR=None,
