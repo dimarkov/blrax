@@ -205,7 +205,8 @@ def _make_leaf(p, hess_init, max_precond_dim, one_sided):
         return DiagEvonLeaf(H=jnp.full(p.shape, hess_init, p.dtype),
                             G_bar=jnp.zeros(p.shape, p.dtype))
     if one_sided and left_ok and right_ok:
-        # keep only the smaller axis
+        # keep only the smaller axis (on a tie d == o either side is equally
+        # cheap; we keep the left one)
         if d <= o:
             right_ok = False
         else:

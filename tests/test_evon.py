@@ -117,6 +117,16 @@ class TestEvonInit(unittest.TestCase):
         self.assertIsNotNone(leaf.QR)
         self.assertEqual(leaf.QR.shape, (3, 3))
 
+    def test_init_one_sided_square_keeps_left_axis(self):
+        # square matrix: both axes equal size, tie kept on the left side
+        params = {'w': jnp.ones((4, 4))}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100, one_sided=True)
+        leaf = tx.init(params).leaves['w']
+        self.assertIsNotNone(leaf.QL)
+        self.assertEqual(leaf.QL.shape, (4, 4))
+        self.assertIsNone(leaf.QR)
+        self.assertIsNone(leaf.R)
+
     def test_init_reshapes_higher_rank(self):
         params = {'k': jnp.ones((2, 3, 5))}  # -> (6, 5)
         tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
