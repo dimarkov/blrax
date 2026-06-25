@@ -407,11 +407,17 @@ class TestEvonIntegration(unittest.TestCase):
 
     def test_structured_posterior_beats_diagonal_on_logistic(self):
         # Corollary 1 (qualitative): EVON's covariance is closer to the exact
-        # full-Gaussian Laplace covariance than IVON's diagonal one.
+        # full-Gaussian Laplace covariance than IVON's diagonal one. Sigma_evon
+        # and Sigma_diag share the same V and differ only by the rotation QL, so
+        # the gap below isolates the structural (off-diagonal) benefit. Features
+        # are correlated (X = Z @ A) so the true covariance has strong
+        # off-diagonals -- otherwise the rotation has almost nothing to capture.
         from jax import hessian
         key = jr.PRNGKey(0)
         n, dext = 80, 6
-        X = jr.normal(key, (n, dext))
+        Z = jr.normal(key, (n, dext))
+        A = jr.normal(jr.PRNGKey(10), (dext, dext))   # mixing -> correlated columns
+        X = Z @ A
         w_star = jr.normal(jr.PRNGKey(1), (dext,))
         probs = jax.nn.sigmoid(X @ w_star)
         y = (jr.uniform(jr.PRNGKey(2), (n,)) < probs).astype(jnp.float32)
