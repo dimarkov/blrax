@@ -32,11 +32,31 @@ def sigma(h, ess, weight_decay):
     return lax.rsqrt(precision(h, ess, weight_decay))
 
 def get_scale(state):
+    if isinstance(state, ScaleByEvonState):
+        ess, wd = state.ess, state.weight_decay
+        def leaf_scale(s):
+            V = 1.0 / (ess * (s.H + wd))           # (d, o)
+            if isinstance(s, DiagEvonLeaf):
+                return jax.numpy.sqrt(V)
+            left = (s.QL * s.QL) if s.QL is not None else None
+            right = (s.QR * s.QR) if s.QR is not None else None
+            var = V
+            if left is not None:
+                var = left @ var
+            if right is not None:
+                var = var @ right.T
+            return jax.numpy.sqrt(var)
+        return jax.tree.map(leaf_scale, state.leaves, is_leaf=_is_evon_leaf)
+    # existing IVON body:
     return jax.tree.map(
         lambda v: sigma(v, state.ess, state.weight_decay), state.hess
     )
 
 def sample_posterior(key, params, state, shape=(), mask=None):
+    if isinstance(state, ScaleByEvonState):
+        samples, _ = _evon_sample_leaves(key, params, state, shape=shape, mask=mask)
+        return samples
+    # existing IVON body unchanged below
     ess = state.ess
     weight_decay = state.weight_decay
 

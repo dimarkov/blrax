@@ -10,6 +10,7 @@ from blrax.states import (
 from blrax.utils import _project, _project_back, precision
 from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian, evon
 from blrax.utils import noisy_value_and_grad, _evon_sample_leaves
+from blrax.utils import sample_posterior, get_scale
 
 
 class TestEvonState(unittest.TestCase):
@@ -312,3 +313,29 @@ class TestEvonSampler(unittest.TestCase):
         samples, _ = _evon_sample_leaves(jr.PRNGKey(3), params, state, shape=(4000,))
         self.assertEqual(samples['w'].shape, (4000, 3, 2))
         self.assertTrue(jnp.allclose(samples['w'].mean(0), 1.0, atol=0.05))
+
+
+class TestEvonPosterior(unittest.TestCase):
+    def test_sample_posterior_dispatches(self):
+        params = {'w': jnp.zeros((3, 2))}
+        tx = scale_by_evon(ess=5., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        s = sample_posterior(jr.PRNGKey(0), params, state, shape=(10,))
+        self.assertEqual(s['w'].shape, (10, 3, 2))
+
+    def test_get_scale_matches_empirical_marginal(self):
+        # rotate to a non-trivial basis, then compare get_scale to empirical std
+        key = jr.PRNGKey(1)
+        QL, _ = jnp.linalg.qr(jr.normal(key, (3, 3)))
+        QR, _ = jnp.linalg.qr(jr.normal(jr.PRNGKey(2), (2, 2)))
+        H = jnp.array([[1.0, 4.0], [2.0, 3.0], [5.0, 1.0]])
+        leaf = MatrixEvonLeaf(L=jnp.eye(3), R=jnp.eye(2), QL=QL, QR=QR,
+                              H=H, G_bar=jnp.zeros((3, 2)))
+        state = ScaleByEvonState(count=jnp.zeros([], jnp.int32), ess=2.0,
+                                 weight_decay=0.5, precond_every=10,
+                                 leaves={'w': leaf})
+        params = {'w': jnp.zeros((3, 2))}
+        scale = get_scale(state)
+        samples, _ = _evon_sample_leaves(jr.PRNGKey(3), params, state, shape=(20000,))
+        emp = samples['w'].std(0)
+        self.assertTrue(jnp.allclose(scale['w'], emp, atol=0.05))
