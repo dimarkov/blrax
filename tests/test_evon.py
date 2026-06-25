@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import optax
 import unittest
 from jax import random as jr
 
@@ -7,7 +8,7 @@ from blrax.states import (
     MatrixEvonLeaf, DiagEvonLeaf, ScaleByEvonState, _is_evon_leaf,
 )
 from blrax.utils import _project, _project_back, precision
-from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian
+from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian, evon
 
 
 class TestEvonState(unittest.TestCase):
@@ -222,3 +223,51 @@ class TestEvonLeafUpdate(unittest.TestCase):
                                      count=jnp.asarray(3, jnp.int32),
                                      precond_every=jnp.asarray(10, jnp.int32))
         self.assertTrue(jnp.allclose(new.QL, jnp.eye(3)))
+
+
+class TestEvonUpdate(unittest.TestCase):
+    def _set_noise(self, state, value=0.1):
+        # fill transient noise on every leaf so update can run deterministically
+        def fill(leaf):
+            return leaf._replace(noise=jnp.full(leaf.H.shape, value, leaf.H.dtype))
+        leaves = jax.tree.map(fill, state.leaves, is_leaf=_is_evon_leaf)
+        return state._replace(leaves=leaves)
+
+    def test_update_runs_and_increments_count(self):
+        params = {'w': jnp.ones((4, 3)), 'b': jnp.ones(3)}
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        state = self._set_noise(tx.init(params))
+        grads = {'w': jnp.ones((4, 3)) * 0.2, 'b': jnp.ones(3) * 0.1}
+        updates, new_state = tx.update(grads, state, params)
+        self.assertEqual(updates['w'].shape, (4, 3))
+        self.assertEqual(int(new_state.count), 1)
+        self.assertIsNone(jax.tree.leaves(new_state.leaves, is_leaf=_is_evon_leaf)[0].noise)
+        self.assertTrue(jnp.all(jnp.isfinite(updates['w'])))
+
+    def test_evon_wrapper_one_step(self):
+        params = {'w': jnp.ones((4, 3)), 'b': jnp.ones(3)}
+        tx = evon(learning_rate=1e-2, ess=10., hess_init=1.0, max_precond_dim=100)
+        state = tx.init(params)
+        # fill noise on the inner scale_by_evon state (index 0 of the chain)
+        inner = state[0]
+        def fill(leaf):
+            return leaf._replace(noise=jnp.full(leaf.H.shape, 0.1, leaf.H.dtype))
+        state = (inner._replace(leaves=jax.tree.map(fill, inner.leaves, is_leaf=_is_evon_leaf)),) + state[1:]
+        grads = {'w': jnp.ones((4, 3)) * 0.2, 'b': jnp.ones(3) * 0.1}
+        updates, _ = tx.update(grads, state, params)
+        new_params = optax.apply_updates(params, updates)
+        self.assertTrue(jnp.all(jnp.isfinite(new_params['w'])))
+
+    def test_diagonal_evon_matches_reference_trajectory(self):
+        # all-diagonal (max_precond_dim=0): EVON == diagonal IVON-no-debias, step by step.
+        ess, wd, b1, b2 = 10., 0.5, 0.9, 0.5
+        params = {'w': jnp.array([0.5, -1.0, 2.0, 0.3])}
+        grads = {'w': jnp.array([0.3, 0.7, -0.2, 0.1])}
+        tx = scale_by_evon(ess=ess, hess_init=1.0, b1=b1, b2=b2, weight_decay=wd,
+                           max_precond_dim=0)
+        state = self._set_noise(tx.init(params), value=0.4)
+        noise = jnp.full(4, 0.4)
+        updates, _ = tx.update(grads, state, params)
+        U, _, _ = _ref_diag_update(grads['w'], params['w'], jnp.ones(4),
+                                   jnp.zeros(4), noise, ess, wd, b1, b2)
+        self.assertTrue(jnp.allclose(updates['w'], U))

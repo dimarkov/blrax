@@ -1,3 +1,3 @@
 __version__ = "0.1.10"
-from blrax.optim import ivon
+from blrax.optim import ivon, evon, scale_by_evon
 from blrax.utils import noisy_value_and_grad, get_scale
