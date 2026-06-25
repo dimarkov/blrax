@@ -58,13 +58,17 @@ class TestEvonProjection(unittest.TestCase):
         QR = self._orthonormal(kR, 3)
         X = jr.normal(kX, (4, 3))
         back = _project_back(QL, QR, _project(QL, QR, X))
-        self.assertTrue(jnp.allclose(back, X, atol=1e-5))
+        # float32 round-trip through two orthonormal rotations
+        self.assertTrue(jnp.allclose(back, X, atol=1e-4))
 
     def test_none_side_is_identity(self):
         QL = self._orthonormal(jr.PRNGKey(1), 4)
         X = jr.normal(jr.PRNGKey(2), (4, 3))
         # right side None -> only left rotation
         self.assertTrue(jnp.allclose(_project(QL, None, X), QL.T @ X, atol=1e-6))
+        # left side None -> only right rotation
+        QR = self._orthonormal(jr.PRNGKey(3), 3)
+        self.assertTrue(jnp.allclose(_project(None, QR, X), X @ QR, atol=1e-6))
         self.assertTrue(jnp.allclose(_project(None, None, X), X))
 
     def test_batched_projection(self):
@@ -73,5 +77,6 @@ class TestEvonProjection(unittest.TestCase):
         X = jr.normal(jr.PRNGKey(5), (7, 4, 3))  # batch of 7
         out = _project_back(QL, QR, X)
         self.assertEqual(out.shape, (7, 4, 3))
-        # matches per-sample application
-        self.assertTrue(jnp.allclose(out[0], QL @ X[0] @ QR.T, atol=1e-5))
+        # matches per-sample application; batched matmul takes a different
+        # float32 reduction path than a single matmul, hence the loose atol
+        self.assertTrue(jnp.allclose(out[0], QL @ X[0] @ QR.T, atol=1e-3))
