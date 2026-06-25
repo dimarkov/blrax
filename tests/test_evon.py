@@ -7,6 +7,7 @@ from blrax.states import (
     MatrixEvonLeaf, DiagEvonLeaf, ScaleByEvonState, _is_evon_leaf,
 )
 from blrax.utils import _project, _project_back
+from blrax.optim import scale_by_evon
 
 
 class TestEvonState(unittest.TestCase):
@@ -80,3 +81,52 @@ class TestEvonProjection(unittest.TestCase):
         # matches per-sample application; batched matmul takes a different
         # float32 reduction path than a single matmul, hence the loose atol
         self.assertTrue(jnp.allclose(out[0], QL @ X[0] @ QR.T, atol=1e-3))
+
+
+class TestEvonInit(unittest.TestCase):
+    def test_init_leaf_kinds_two_sided(self):
+        params = {
+            'w':  jnp.ones((4, 3)),       # 2-D, both small -> two-sided matrix
+            'b':  jnp.ones(3),            # 1-D -> diag
+            's':  jnp.ones(()),           # scalar -> diag
+            'wide': jnp.ones((2, 50)),    # right axis over cutoff -> one-sided (left only)
+        }
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=8, one_sided=False)
+        state = tx.init(params)
+        self.assertIsInstance(state, ScaleByEvonState)
+        L = state.leaves
+        self.assertIsInstance(L['w'], MatrixEvonLeaf)
+        self.assertEqual(L['w'].QL.shape, (4, 4))
+        self.assertEqual(L['w'].QR.shape, (3, 3))
+        self.assertEqual(L['w'].H.shape, (4, 3))
+        self.assertIsInstance(L['b'], DiagEvonLeaf)
+        self.assertIsInstance(L['s'], DiagEvonLeaf)
+        # 'wide': left axis (2) <= 8 kept, right axis (50) > 8 -> None
+        self.assertIsInstance(L['wide'], MatrixEvonLeaf)
+        self.assertIsNotNone(L['wide'].QL)
+        self.assertIsNone(L['wide'].QR)
+        self.assertIsNone(L['wide'].R)
+        self.assertEqual(L['wide'].H.shape, (2, 50))
+
+    def test_init_one_sided_keeps_smaller_axis(self):
+        params = {'w': jnp.ones((8, 3))}  # both <= cutoff
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100, one_sided=True)
+        leaf = tx.init(params).leaves['w']
+        # smaller axis is the right one (3) -> keep QR, drop QL
+        self.assertIsNone(leaf.QL)
+        self.assertIsNotNone(leaf.QR)
+        self.assertEqual(leaf.QR.shape, (3, 3))
+
+    def test_init_reshapes_higher_rank(self):
+        params = {'k': jnp.ones((2, 3, 5))}  # -> (6, 5)
+        tx = scale_by_evon(ess=10., hess_init=1.0, max_precond_dim=100)
+        leaf = tx.init(params).leaves['k']
+        self.assertIsInstance(leaf, MatrixEvonLeaf)
+        self.assertEqual(leaf.H.shape, (6, 5))
+        self.assertEqual(leaf.QL.shape, (6, 6))
+
+    def test_init_identity_bases(self):
+        params = {'w': jnp.ones((4, 3))}
+        leaf = scale_by_evon(ess=1., hess_init=1.0).init(params).leaves['w']
+        self.assertTrue(jnp.allclose(leaf.QL, jnp.eye(4)))
+        self.assertTrue(jnp.allclose(leaf.L, jnp.zeros((4, 4))))

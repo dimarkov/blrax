@@ -1,4 +1,6 @@
 from typing import Any, NamedTuple, Optional, Union
+import math
+import functools
 
 import chex
 import jax
@@ -9,7 +11,11 @@ from jax import random as jr
 from optax._src import utils
 from optax import tree_utils as otu
 
-from blrax.states import ScaleByIvonState
+from blrax.states import (
+    ScaleByIvonState,
+    ScaleByEvonState, MatrixEvonLeaf, DiagEvonLeaf, _is_evon_leaf,
+)
+from blrax.utils import _project, _project_back
 
 ScalarOrSchedule = Union[float, chex.Array, optax.Schedule]
 
@@ -184,3 +190,65 @@ def ivon(
     transform = optax.chain(ivon_trans, *lr_scale)
 
   return transform
+
+
+def _make_leaf(p, hess_init, max_precond_dim, one_sided):
+    """Static per-leaf construction from the parameter array ``p``."""
+    if p.ndim < 2:
+        return DiagEvonLeaf(H=jnp.full(p.shape, hess_init, p.dtype),
+                            G_bar=jnp.zeros(p.shape, p.dtype))
+    d = math.prod(p.shape[:-1])
+    o = p.shape[-1]
+    left_ok = d <= max_precond_dim
+    right_ok = o <= max_precond_dim
+    if not left_ok and not right_ok:
+        return DiagEvonLeaf(H=jnp.full(p.shape, hess_init, p.dtype),
+                            G_bar=jnp.zeros(p.shape, p.dtype))
+    if one_sided and left_ok and right_ok:
+        # keep only the smaller axis
+        if d <= o:
+            right_ok = False
+        else:
+            left_ok = False
+    L = jnp.zeros((d, d), p.dtype) if left_ok else None
+    QL = jnp.eye(d, dtype=p.dtype) if left_ok else None
+    R = jnp.zeros((o, o), p.dtype) if right_ok else None
+    QR = jnp.eye(o, dtype=p.dtype) if right_ok else None
+    return MatrixEvonLeaf(L=L, R=R, QL=QL, QR=QR,
+                          H=jnp.full((d, o), hess_init, p.dtype),
+                          G_bar=jnp.zeros((d, o), p.dtype))
+
+
+def scale_by_evon(
+    ess: float,
+    hess_init: float,
+    b1: float = 0.9,
+    b2: float = 0.99999,
+    b3: float = 0.95,
+    weight_decay: float = 1e-4,
+    precond_every: int = 10,
+    max_precond_dim: int = 10000,
+    one_sided: bool = False,
+    m_dtype=None,
+) -> optax.GradientTransformation:
+    """Rescale updates according to the EVON algorithm (Minut et al., 2026)."""
+    m_dtype = utils.canonicalize_dtype(m_dtype)
+
+    def init_fn(params):
+        leaves = jax.tree.map(
+            functools.partial(_make_leaf, hess_init=hess_init,
+                              max_precond_dim=max_precond_dim, one_sided=one_sided),
+            params,
+        )
+        return ScaleByEvonState(
+            count=jnp.zeros([], jnp.int32),
+            ess=ess,
+            weight_decay=weight_decay,
+            precond_every=jnp.asarray(precond_every, jnp.int32),
+            leaves=leaves,
+        )
+
+    def update_fn(updates, state, params):
+        raise NotImplementedError  # implemented in Task 5
+
+    return optax.GradientTransformation(init_fn, update_fn)
