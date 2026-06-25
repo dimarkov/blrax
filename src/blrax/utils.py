@@ -7,6 +7,24 @@ from blrax.states import ScaleByIvonState
 from jax import lax
 
 
+def _project(QL, QR, X):
+    """G° = QLᵀ X QR, skipping any None side. Leading batch dims on X are OK."""
+    if QL is not None:
+        X = jax.numpy.swapaxes(QL, -1, -2) @ X
+    if QR is not None:
+        X = X @ QR
+    return X
+
+
+def _project_back(QL, QR, U):
+    """Δ = QL U QRᵀ, skipping any None side. Leading batch dims on U are OK."""
+    if QL is not None:
+        U = QL @ U
+    if QR is not None:
+        U = U @ jax.numpy.swapaxes(QR, -1, -2)
+    return U
+
+
 def precision(h, ess, weight_decay):
     return ess * (h + weight_decay)
 

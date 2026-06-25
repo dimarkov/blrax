@@ -6,6 +6,7 @@ from jax import random as jr
 from blrax.states import (
     MatrixEvonLeaf, DiagEvonLeaf, ScaleByEvonState, _is_evon_leaf,
 )
+from blrax.utils import _project, _project_back
 
 
 class TestEvonState(unittest.TestCase):
@@ -43,3 +44,34 @@ class TestEvonState(unittest.TestCase):
         # flatten treating containers as leaves -> exactly the two containers
         cont = jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf)
         self.assertEqual(len(cont), 2)
+
+
+class TestEvonProjection(unittest.TestCase):
+    def _orthonormal(self, key, n):
+        a = jr.normal(key, (n, n))
+        q, _ = jnp.linalg.qr(a)
+        return q
+
+    def test_roundtrip_two_sided(self):
+        kL, kR, kX = jr.split(jr.PRNGKey(0), 3)
+        QL = self._orthonormal(kL, 4)
+        QR = self._orthonormal(kR, 3)
+        X = jr.normal(kX, (4, 3))
+        back = _project_back(QL, QR, _project(QL, QR, X))
+        self.assertTrue(jnp.allclose(back, X, atol=1e-5))
+
+    def test_none_side_is_identity(self):
+        QL = self._orthonormal(jr.PRNGKey(1), 4)
+        X = jr.normal(jr.PRNGKey(2), (4, 3))
+        # right side None -> only left rotation
+        self.assertTrue(jnp.allclose(_project(QL, None, X), QL.T @ X, atol=1e-6))
+        self.assertTrue(jnp.allclose(_project(None, None, X), X))
+
+    def test_batched_projection(self):
+        QL = self._orthonormal(jr.PRNGKey(3), 4)
+        QR = self._orthonormal(jr.PRNGKey(4), 3)
+        X = jr.normal(jr.PRNGKey(5), (7, 4, 3))  # batch of 7
+        out = _project_back(QL, QR, X)
+        self.assertEqual(out.shape, (7, 4, 3))
+        # matches per-sample application
+        self.assertTrue(jnp.allclose(out[0], QL @ X[0] @ QR.T, atol=1e-5))
