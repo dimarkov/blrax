@@ -7,7 +7,7 @@ import jax
 import optax
 import jax.numpy as jnp
 
-from jax import random as jr
+from jax import lax, random as jr
 from optax._src import utils
 from optax import tree_utils as otu
 
@@ -15,7 +15,7 @@ from blrax.states import (
     ScaleByIvonState,
     ScaleByEvonState, MatrixEvonLeaf, DiagEvonLeaf, _is_evon_leaf,
 )
-from blrax.utils import _project, _project_back
+from blrax.utils import _project, _project_back, precision
 
 ScalarOrSchedule = Union[float, chex.Array, optax.Schedule]
 
@@ -190,6 +190,71 @@ def ivon(
     transform = optax.chain(ivon_trans, *lr_scale)
 
   return transform
+
+
+def _qr_power_iter(M32, Q32):
+    """One warm-started power-iteration step; float32 in, float32 out."""
+    eig_est = jnp.diag(Q32.T @ M32 @ Q32)
+    idx = jnp.argsort(eig_est)[::-1]          # descending
+    Qs = Q32[:, idx]
+    Qn, _ = jnp.linalg.qr(M32 @ Qs)
+    return Qn
+
+
+def _refresh_side(M, Q, do_refresh, first):
+    """Return the (possibly refreshed) eigenbasis for one side. M, Q non-None."""
+    M32 = M.astype(jnp.float32)
+    Q32 = Q.astype(jnp.float32)
+
+    def refresh():
+        def via_eigh():
+            _, vecs = jnp.linalg.eigh(M32)
+            return vecs[:, ::-1]              # descending eigenvalue order
+        return lax.cond(first, via_eigh, lambda: _qr_power_iter(M32, Q32))
+
+    Qn32 = lax.cond(do_refresh, refresh, lambda: Q32)
+    return Qn32.astype(Q.dtype)
+
+
+def _update_diag_leaf(g, p, leaf, ess, wd, b1, b2):
+    Hhat = leaf.noise * g * precision(leaf.H, ess, wd)
+    G_bar = b1 * leaf.G_bar + (1 - b1) * g
+    H = update_hessian(leaf.H, Hhat, b2, wd)
+    U = (G_bar + wd * p) / (H + wd)
+    return U, DiagEvonLeaf(H=H, G_bar=G_bar, noise=None)
+
+
+def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
+    orig_shape = g.shape
+    d, o = leaf.H.shape
+    G = g.reshape(d, o)
+    M = p.reshape(d, o)
+    E = leaf.noise
+
+    Go = _project(leaf.QL, leaf.QR, G)
+    Hhat = E * Go * precision(leaf.H, ess, wd)
+    G_bar = b1 * leaf.G_bar + (1 - b1) * Go
+    H = update_hessian(leaf.H, Hhat, b2, wd)
+    Mo = _project(leaf.QL, leaf.QR, M)
+    U = (G_bar + wd * Mo) / (H + wd)
+    delta = _project_back(leaf.QL, leaf.QR, U).reshape(orig_shape)
+
+    # preconditioner EMAs (raw G), present sides only
+    L = (b3 * leaf.L + (1 - b3) * (G @ G.T)) if leaf.L is not None else None
+    R = (b3 * leaf.R + (1 - b3) * (G.T @ G)) if leaf.R is not None else None
+
+    # eigenbasis refresh + momentum rotation (after the param update)
+    do_refresh = (count % precond_every) == 0
+    first = count == precond_every
+    QL_new = _refresh_side(L, leaf.QL, do_refresh, first) if leaf.QL is not None else None
+    QR_new = _refresh_side(R, leaf.QR, do_refresh, first) if leaf.QR is not None else None
+    if leaf.QL is not None:
+        G_bar = (QL_new.T @ leaf.QL) @ G_bar
+    if leaf.QR is not None:
+        G_bar = G_bar @ (leaf.QR.T @ QR_new)
+
+    return delta, MatrixEvonLeaf(L=L, R=R, QL=QL_new, QR=QR_new,
+                                 H=H, G_bar=G_bar, noise=None)
 
 
 def _make_leaf(p, hess_init, max_precond_dim, one_sided):

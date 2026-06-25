@@ -6,8 +6,8 @@ from jax import random as jr
 from blrax.states import (
     MatrixEvonLeaf, DiagEvonLeaf, ScaleByEvonState, _is_evon_leaf,
 )
-from blrax.utils import _project, _project_back
-from blrax.optim import scale_by_evon
+from blrax.utils import _project, _project_back, precision
+from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian
 
 
 class TestEvonState(unittest.TestCase):
@@ -140,3 +140,83 @@ class TestEvonInit(unittest.TestCase):
         leaf = scale_by_evon(ess=1., hess_init=1.0).init(params).leaves['w']
         self.assertTrue(jnp.allclose(leaf.QL, jnp.eye(4)))
         self.assertTrue(jnp.allclose(leaf.L, jnp.zeros((4, 4))))
+
+
+def _ref_diag_update(g, p, H, G_bar, noise, ess, wd, b1, b2):
+    """Closed-form diagonal IVON-without-debias reference (quadratic correction kept)."""
+    Hhat = noise * g * precision(H, ess, wd)
+    G_bar2 = b1 * G_bar + (1 - b1) * g
+    H2 = update_hessian(H, Hhat, b2, wd)
+    U = (G_bar2 + wd * p) / (H2 + wd)
+    return U, H2, G_bar2
+
+
+class TestEvonLeafUpdate(unittest.TestCase):
+    def test_diag_leaf_matches_reference(self):
+        ess, wd, b1, b2 = 10., 0.5, 0.9, 0.5
+        p = jnp.array([0.5, -1.0, 2.0])
+        g = jnp.array([0.3, 0.7, -0.2])
+        leaf = DiagEvonLeaf(H=jnp.array([1.0, 2.0, 3.0]),
+                            G_bar=jnp.array([0.1, -0.1, 0.0]),
+                            noise=jnp.array([0.4, -0.3, 0.2]))
+        delta, new = _update_diag_leaf(g, p, leaf, ess, wd, b1, b2)
+        U, H2, G2 = _ref_diag_update(g, p, leaf.H, leaf.G_bar, leaf.noise, ess, wd, b1, b2)
+        self.assertTrue(jnp.allclose(delta, U))
+        self.assertTrue(jnp.allclose(new.H, H2))
+        self.assertTrue(jnp.allclose(new.G_bar, G2))
+        self.assertIsNone(new.noise)
+
+    def test_matrix_leaf_with_identity_Q_reduces_to_diagonal(self):
+        # QL=QR=I and no refresh (precond_every huge) -> matrix path == diagonal path
+        ess, wd, b1, b2, b3 = 10., 0.5, 0.9, 0.5, 0.95
+        p = jnp.array([[0.5, -1.0], [2.0, 0.3]])
+        g = jnp.array([[0.3, 0.7], [-0.2, 0.1]])
+        H = jnp.array([[1.0, 2.0], [3.0, 1.5]])
+        Gb = jnp.zeros((2, 2))
+        E = jnp.array([[0.4, -0.3], [0.2, 0.5]])
+        leaf = MatrixEvonLeaf(L=jnp.eye(2), R=jnp.eye(2), QL=jnp.eye(2), QR=jnp.eye(2),
+                              H=H, G_bar=Gb, noise=E)
+        delta, new = _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3,
+                                         count=jnp.asarray(1, jnp.int32),
+                                         precond_every=jnp.asarray(10**9, jnp.int32))
+        # reference: elementwise diagonal IVON-no-debias (since G°=G, Δ=U)
+        U, H2, G2 = _ref_diag_update(g, p, H, Gb, E, ess, wd, b1, b2)
+        self.assertTrue(jnp.allclose(delta, U, atol=1e-6))
+        self.assertTrue(jnp.allclose(new.H, H2, atol=1e-6))
+        self.assertTrue(jnp.allclose(new.G_bar, G2, atol=1e-6))
+        self.assertIsNone(new.noise)
+
+    def test_refresh_makes_orthonormal_basis_and_is_isometry(self):
+        # build a leaf with a non-trivial L; trigger a first refresh (eigh)
+        key = jr.PRNGKey(0)
+        A = jr.normal(key, (4, 4))
+        L = A @ A.T + jnp.eye(4)         # SPD
+        leaf = MatrixEvonLeaf(L=L, R=None, QL=jnp.eye(4), QR=None,
+                              H=jnp.ones((4, 3)), G_bar=jr.normal(jr.PRNGKey(1), (4, 3)),
+                              noise=jnp.zeros((4, 3)))
+        g = jr.normal(jr.PRNGKey(2), (4, 3))
+        p = jnp.zeros((4, 3))
+        old_repr = leaf.QL @ leaf.G_bar          # left-only: Q_L Ḡ (right identity)
+        # count == precond_every triggers the first (eigh) refresh
+        # b1=1.0: pure-rotation test (no EMA mixing) so the isometry is exact
+        _, new = _update_matrix_leaf(g, p, leaf, 10., 0.5, 1.0, 0.5, 0.95,
+                                     count=jnp.asarray(10, jnp.int32),
+                                     precond_every=jnp.asarray(10, jnp.int32))
+        # QL stays orthonormal
+        self.assertTrue(jnp.allclose(new.QL.T @ new.QL, jnp.eye(4), atol=1e-5))
+        # momentum rotation is an isometry of the represented object Q_L Ḡ
+        new_repr = new.QL @ new.G_bar
+        self.assertTrue(jnp.allclose(jnp.linalg.norm(new_repr),
+                                     jnp.linalg.norm(old_repr), atol=1e-4))
+
+    def test_no_refresh_leaves_basis_unchanged(self):
+        leaf = MatrixEvonLeaf(L=jnp.eye(3) * 2, R=None, QL=jnp.eye(3), QR=None,
+                              H=jnp.ones((3, 2)), G_bar=jnp.zeros((3, 2)),
+                              noise=jnp.zeros((3, 2)))
+        g = jnp.ones((3, 2))
+        p = jnp.zeros((3, 2))
+        # count not a multiple of precond_every -> no refresh
+        _, new = _update_matrix_leaf(g, p, leaf, 10., 0.5, 0.9, 0.5, 0.95,
+                                     count=jnp.asarray(3, jnp.int32),
+                                     precond_every=jnp.asarray(10, jnp.int32))
+        self.assertTrue(jnp.allclose(new.QL, jnp.eye(3)))
