@@ -195,7 +195,7 @@ def ivon(
 def _qr_power_iter(M32, Q32):
     """One warm-started power-iteration step; float32 in, float32 out."""
     eig_est = jnp.diag(Q32.T @ M32 @ Q32)
-    idx = jnp.argsort(eig_est)[::-1]          # descending
+    idx = jnp.argsort(eig_est, descending=True)
     Qs = Q32[:, idx]
     Qn, _ = jnp.linalg.qr(M32 @ Qs)
     return Qn
