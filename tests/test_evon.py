@@ -531,3 +531,46 @@ class TestEvonHutchinsonConfig(unittest.TestCase):
         self.assertIsNone(d.h_hat)
         m2 = m._replace(h_hat=jnp.ones((3, 2)))
         self.assertIsNotNone(m2.h_hat)
+
+
+class TestEvonHutchinsonLeafUpdate(unittest.TestCase):
+    def test_diag_leaf_uses_h_hat_when_present(self):
+        # noise path and h_hat path are constructed to give different H.
+        leaf = DiagEvonLeaf(H=jnp.ones(3), G_bar=jnp.zeros(3),
+                            noise=jnp.full((3,), 5.0), h_hat=jnp.zeros(3))
+        g = jnp.full((3,), 7.0)
+        _, s = _update_diag_leaf(g, jnp.zeros(3), leaf, ess=1.0, wd=1e-4, b1=0.9, b2=0.5)
+        # With h_hat == 0, update_hessian(H=1, t=0, decay=0.5) = 0.5*1 + 0.5*0 + corr.
+        expected = update_hessian(jnp.ones(3), jnp.zeros(3), 0.5, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+        self.assertIsNone(s.h_hat)
+        self.assertIsNone(s.noise)
+
+    def test_diag_leaf_freezes_when_h_hat_equals_H(self):
+        H0 = jnp.array([2.0, 3.0, 4.0])
+        leaf = DiagEvonLeaf(H=H0, G_bar=jnp.zeros(3), h_hat=H0)
+        _, s = _update_diag_leaf(jnp.ones(3), jnp.zeros(3), leaf,
+                                 ess=1.0, wd=1e-4, b1=0.9, b2=0.95)
+        self.assertTrue(jnp.allclose(s.H, H0))   # frozen
+
+    def test_diag_leaf_reparam_path_unchanged_when_h_hat_none(self):
+        leaf = DiagEvonLeaf(H=jnp.ones(3), G_bar=jnp.zeros(3),
+                            noise=jnp.full((3,), 0.5))
+        g = jnp.full((3,), 2.0)
+        _, s = _update_diag_leaf(g, jnp.zeros(3), leaf, ess=1.0, wd=1e-4, b1=0.9, b2=0.95)
+        Hhat = leaf.noise * g * precision(leaf.H, 1.0, 1e-4)
+        expected = update_hessian(leaf.H, Hhat, 0.95, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+
+    def test_matrix_leaf_uses_h_hat_when_present(self):
+        leaf = MatrixEvonLeaf(L=jnp.eye(3), R=jnp.eye(2), QL=jnp.eye(3), QR=jnp.eye(2),
+                              H=jnp.ones((3, 2)), G_bar=jnp.zeros((3, 2)),
+                              noise=jnp.full((3, 2), 9.0), h_hat=jnp.zeros((3, 2)))
+        g = jnp.full((3, 2), 4.0)
+        _, s = _update_matrix_leaf(g, jnp.zeros((3, 2)), leaf, ess=1.0, wd=1e-4,
+                                   b1=0.9, b2=0.5, b3=0.95, count=jnp.int32(1),
+                                   precond_every=jnp.int32(10**6))
+        expected = update_hessian(jnp.ones((3, 2)), jnp.zeros((3, 2)), 0.5, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+        self.assertIsNone(s.h_hat)
+        self.assertIsNone(s.noise)

@@ -217,11 +217,11 @@ def _refresh_side(M, Q, do_refresh, first):
 
 
 def _update_diag_leaf(g, p, leaf, ess, wd, b1, b2):
-    Hhat = leaf.noise * g * precision(leaf.H, ess, wd)
+    Hhat = leaf.h_hat if leaf.h_hat is not None else (leaf.noise * g * precision(leaf.H, ess, wd))
     G_bar = b1 * leaf.G_bar + (1 - b1) * g
     H = update_hessian(leaf.H, Hhat, b2, wd)
     U = (G_bar + wd * p) / (H + wd)
-    return U, DiagEvonLeaf(H=H, G_bar=G_bar, noise=None)
+    return U, DiagEvonLeaf(H=H, G_bar=G_bar, noise=None, h_hat=None)
 
 
 def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
@@ -229,10 +229,12 @@ def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
     d, o = leaf.H.shape
     G = g.reshape(d, o)
     M = p.reshape(d, o)
-    E = leaf.noise
 
     Go = _project(leaf.QL, leaf.QR, G)
-    Hhat = E * Go * precision(leaf.H, ess, wd)
+    if leaf.h_hat is not None:
+        Hhat = leaf.h_hat
+    else:
+        Hhat = leaf.noise * Go * precision(leaf.H, ess, wd)
     G_bar = b1 * leaf.G_bar + (1 - b1) * Go
     H = update_hessian(leaf.H, Hhat, b2, wd)
     Mo = _project(leaf.QL, leaf.QR, M)
@@ -254,7 +256,7 @@ def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
         G_bar = G_bar @ (leaf.QR.T @ QR_new)
 
     return delta, MatrixEvonLeaf(L=L, R=R, QL=QL_new, QR=QR_new,
-                                 H=H, G_bar=G_bar, noise=None)
+                                 H=H, G_bar=G_bar, noise=None, h_hat=None)
 
 
 def _make_leaf(p, hess_init, max_precond_dim, one_sided, m_dtype=None):
