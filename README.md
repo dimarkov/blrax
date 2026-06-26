@@ -124,10 +124,16 @@ period), `max_precond_dim` (axes larger than this are left diagonal), `one_sided
 only the smaller axis of each matrix). 1-D parameters (biases, norms) fall back to diagonal IVON
 automatically.
 
+> **Note:** for EVON, the at-the-mean `hutchinson` estimator does not produce good posteriors
+> (the mode Hessian collapses in flat/over-parameterised directions, over-dispersing the
+> samples). Use the default sampling estimator for posterior inference. See
+> [`examples/recreate_fig3_logreg.ipynb`](examples/recreate_fig3_logreg.ipynb).
+
 ## Examples
 * [`examples/test_mnist.ipynb`](examples/test_mnist.ipynb) — IVON on MNIST.
 * [`examples/compare_ivon_estimators.ipynb`](examples/compare_ivon_estimators.ipynb) — sampling vs. Hutchinson.
 * [`examples/compare_ivon_evon.ipynb`](examples/compare_ivon_evon.ipynb) — IVON vs. EVON (accuracy, calibration, Bayesian model averaging, cost).
+* [`examples/recreate_fig3_logreg.ipynb`](examples/recreate_fig3_logreg.ipynb) — recreates Fig. 3 of the EVON paper (USPS 3vs5 logistic regression); EVON vs. full-Gaussian VI, plus the Hutchinson posterior-quality diagnostic.
 * [`examples/tune_ivon.py`](examples/tune_ivon.py) — Optuna hyper-parameter search (validation NLL).
 
 ### TODO

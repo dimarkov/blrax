@@ -216,7 +216,7 @@ def _refresh_side(M, Q, do_refresh, first):
     return Qn32.astype(Q.dtype)
 
 
-_HESS_CLIP_EPS = 1e-2
+_HESS_CLIP_EPS = 1e-6
 
 
 def _clip_hessian(F, H, clip_ratio):
