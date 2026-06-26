@@ -130,6 +130,75 @@ def evon_sample_and_grad(key, loss_fn, params, state, *args, mask=None, **kwargs
     return out, grads, state._replace(leaves=leaves)
 
 
+def evon_hutchinson_and_grad(key, loss_fn, params, state, *args, mask=None, **kwargs):
+    """Mode + Hutchinson estimator for EVON.
+
+    Computes the gradient at the posterior mean ``params`` every step and the
+    diagonal eigenbasis Hessian via one Rademacher probe and one Hessian-vector
+    product (``jax.jvp`` of ``jax.value_and_grad``). The HVP runs only on steps
+    where ``(count + 1) % hess_every == 0`` -- aligned with the eigenbasis refresh
+    in ``scale_by_evon`` (which fires on the post-increment ``count``). On the
+    intervening steps the HVP is skipped and ``h_hat`` is set to the current ``H``
+    so the downstream EMA and quadratic correction leave ``H`` unchanged.
+
+    The probe ``E`` is drawn in eigenbasis coordinates (shape ``leaf.H.shape``),
+    projected to parameter space for the HVP, and the HVP is projected back, so
+    ``h_hat = E ⊙ (Q_Lᵀ ∇²ℓ(M) Q_L E Q_Rᵀ Q_R)`` estimates ``diag(H°)`` in actual
+    Hessian units (no ``pi(h)`` rescaling).
+    """
+    estimate_step = ((state.count + 1) % state.hess_every) == 0
+    k_probe, k_loss = jax.random.split(key)
+
+    def f(p):
+        return loss_fn(p, *args, k_loss)
+
+    p_leaves, treedef = jax.tree.flatten(params)
+    s_leaves = jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf)
+    if mask is not None:
+        m_leaves = treedef.flatten_up_to(mask)
+    else:
+        m_leaves = [None] * len(p_leaves)
+
+    def estimate():
+        probes, tangents = [], []
+        k = k_probe
+        for p, s, m in zip(p_leaves, s_leaves, m_leaves):
+            k, rk = jax.random.split(k)
+            E = jax.random.rademacher(rk, shape=s.H.shape, dtype=p.dtype)
+            if isinstance(s, MatrixEvonLeaf):
+                Vp = _project_back(s.QL, s.QR, E).reshape(p.shape)
+            else:
+                Vp = E.reshape(p.shape)
+            if m is not None:
+                Vp = jax.numpy.where(m, Vp, 0.0)
+            probes.append(E)
+            tangents.append(Vp)
+        Vp_tree = jax.tree.unflatten(treedef, tangents)
+        (out, grad), (_, hvp) = jax.jvp(
+            jax.value_and_grad(f, **kwargs), (params,), (Vp_tree,))
+        hvp_leaves = treedef.flatten_up_to(hvp)
+        h_hats = []
+        for E, s, hv in zip(probes, s_leaves, hvp_leaves):
+            if isinstance(s, MatrixEvonLeaf):
+                d, o = s.H.shape
+                HVo = _project(s.QL, s.QR, hv.reshape(d, o))
+                h_hats.append(E * HVo)
+            else:
+                h_hats.append(E * hv)
+        return out, grad, h_hats
+
+    def reuse():
+        out, grad = jax.value_and_grad(f, **kwargs)(params)
+        h_hats = [s.H for s in s_leaves]
+        return out, grad, h_hats
+
+    out, grad, h_hats = lax.cond(estimate_step, estimate, reuse)
+
+    new_leaves = [s._replace(noise=None, h_hat=h) for s, h in zip(s_leaves, h_hats)]
+    leaves = jax.tree.unflatten(treedef, new_leaves)
+    return out, grad, state._replace(leaves=leaves)
+
+
 def tree_stack(pytree_list, axis=0):
     def stack(*args):
         return jax.numpy.stack(args, axis=axis)

@@ -12,6 +12,7 @@ from blrax.utils import _project, _project_back, precision
 from blrax.optim import scale_by_evon, _update_diag_leaf, _update_matrix_leaf, update_hessian, evon
 from blrax.utils import noisy_value_and_grad, _evon_sample_leaves
 from blrax.utils import sample_posterior, get_scale
+from blrax.utils import evon_hutchinson_and_grad
 
 
 class TestEvonState(unittest.TestCase):
@@ -574,3 +575,69 @@ class TestEvonHutchinsonLeafUpdate(unittest.TestCase):
         self.assertTrue(jnp.allclose(s.H, expected))
         self.assertIsNone(s.h_hat)
         self.assertIsNone(s.noise)
+
+
+class TestEvonHutchinsonEstimator(unittest.TestCase):
+    def _state_at_count(self, opt, params, count):
+        state = opt.init(params)
+        return state._replace(count=jnp.int32(count))
+
+    def test_stashes_h_hat_and_clears_noise_on_estimate_step(self):
+        params = {'w': jnp.ones((3, 2))}
+        opt = scale_by_evon(ess=1.0, hess_init=1.0, precond_every=10, hess_every=10)
+        state = self._state_at_count(opt, params, 9)   # (9+1) % 10 == 0 -> estimate
+
+        def loss_fn(p, key):
+            return 0.5 * jnp.sum(p['w'] ** 2)
+
+        _, grad, new_state = evon_hutchinson_and_grad(
+            jr.PRNGKey(0), loss_fn, params, state)
+        leaf = jax.tree.leaves(new_state.leaves, is_leaf=_is_evon_leaf)[0]
+        self.assertIsNotNone(leaf.h_hat)
+        self.assertIsNone(leaf.noise)
+        self.assertEqual(leaf.h_hat.shape, leaf.H.shape)
+
+    def test_reuse_step_freezes_h_hat_to_current_H(self):
+        params = {'w': jnp.ones((3, 2))}
+        opt = scale_by_evon(ess=1.0, hess_init=1.0, precond_every=10, hess_every=10)
+        state = self._state_at_count(opt, params, 3)   # (3+1) % 10 != 0 -> reuse
+        H_before = jax.tree.leaves(state.leaves, is_leaf=_is_evon_leaf)[0].H
+
+        def loss_fn(p, key):
+            return 0.5 * jnp.sum(p['w'] ** 2)
+
+        _, _, new_state = evon_hutchinson_and_grad(jr.PRNGKey(0), loss_fn, params, state)
+        leaf = jax.tree.leaves(new_state.leaves, is_leaf=_is_evon_leaf)[0]
+        self.assertTrue(jnp.allclose(leaf.h_hat, H_before))   # frozen
+
+    def test_unbiased_diagonal_in_left_eigenbasis(self):
+        # loss(W) = 0.5 * sum_o W[:,o]^T A W[:,o]; Hessian per column = A.
+        # In a left eigenbasis QL (right side diagonal), E[h_hat] = diag(QL^T A QL),
+        # broadcast across columns.
+        key = jr.PRNGKey(1)
+        d, o = 4, 3
+        Araw = jr.normal(key, (d, d))
+        A = Araw @ Araw.T + d * jnp.eye(d)          # SPD, well-conditioned
+        QL, _ = jnp.linalg.qr(jr.normal(jr.PRNGKey(2), (d, d)))
+        leaf = MatrixEvonLeaf(L=jnp.eye(d), R=None, QL=QL, QR=None,
+                              H=jnp.ones((d, o)), G_bar=jnp.zeros((d, o)))
+        state = ScaleByEvonState(count=jnp.int32(9), ess=1.0, weight_decay=1e-4,
+                                 precond_every=jnp.int32(10), hess_every=jnp.int32(10),
+                                 leaves={'w': leaf})
+        params = {'w': jnp.zeros((d, o))}
+
+        def loss_fn(p, key):
+            W = p['w']
+            return 0.5 * jnp.sum(W * (A @ W))
+
+        def one_hhat(k):
+            _, _, ns = evon_hutchinson_and_grad(k, loss_fn, params, state)
+            return jax.tree.leaves(ns.leaves, is_leaf=_is_evon_leaf)[0].h_hat
+
+        # 20000 probes: max abs error ~0.04, well under atol below (per-probe std
+        # ~4.9, so std of the mean ~0.035; 4000 probes is too few for a stable
+        # max-over-12-elements assertion).
+        keys = jr.split(jr.PRNGKey(3), 20000)
+        mean_hhat = jnp.mean(jax.vmap(one_hhat)(keys), axis=0)   # (d, o)
+        target = jnp.diag(QL.T @ A @ QL)[:, None] * jnp.ones((d, o))
+        self.assertTrue(jnp.allclose(mean_hhat, target, atol=2e-1))
