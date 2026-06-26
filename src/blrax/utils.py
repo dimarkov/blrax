@@ -350,6 +350,8 @@ def noisy_value_and_grad(loss_fn, opt_state, params, key, *args, mc_samples=1, m
           around posterior samples, or ``'hutchinson'`` for a variational-Laplace
           estimate at the mean using Hutchinson's diagonal Hessian estimator. With
           ``'hutchinson'`` the ``mc_samples`` and ``method`` arguments are ignored.
+          Applies to both IVON and EVON; for EVON the Hutchinson HVP is gated by
+          ``hess_every`` (estimated in the eigenbasis, frozen on other steps).
 
     Returns:
         loss_value: Array,
@@ -358,8 +360,12 @@ def noisy_value_and_grad(loss_fn, opt_state, params, key, *args, mc_samples=1, m
     """
     ivon_state = opt_state[0]
     if isinstance(ivon_state, ScaleByEvonState):
-        out, updates, ivon_state = evon_sample_and_grad(
-            key, loss_fn, params, ivon_state, *args, mask=mask, **kwargs)
+        if estimator == 'hutchinson':
+            out, updates, ivon_state = evon_hutchinson_and_grad(
+                key, loss_fn, params, ivon_state, *args, mask=mask, **kwargs)
+        else:
+            out, updates, ivon_state = evon_sample_and_grad(
+                key, loss_fn, params, ivon_state, *args, mask=mask, **kwargs)
         opt_state = (ivon_state,) + opt_state[1:]
     elif isinstance(ivon_state, ScaleByIvonState):
         if estimator == 'hutchinson':

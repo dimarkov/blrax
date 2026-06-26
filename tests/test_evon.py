@@ -641,3 +641,74 @@ class TestEvonHutchinsonEstimator(unittest.TestCase):
         mean_hhat = jnp.mean(jax.vmap(one_hhat)(keys), axis=0)   # (d, o)
         target = jnp.diag(QL.T @ A @ QL)[:, None] * jnp.ones((d, o))
         self.assertTrue(jnp.allclose(mean_hhat, target, atol=2e-1))
+
+
+class TestEvonHutchinsonIntegration(unittest.TestCase):
+    def test_dispatch_hutchinson_vs_sampling(self):
+        params = {'w': jnp.ones((3, 2))}
+        opt = evon(1e-2, ess=1.0, hess_init=1.0, precond_every=10)
+        opt_state = opt.init(params)
+        opt_state = (opt_state[0]._replace(count=jnp.int32(9)),) + opt_state[1:]
+
+        def loss_fn(p, key):
+            return 0.5 * jnp.sum(p['w'] ** 2)
+
+        _, _, st_h = noisy_value_and_grad(loss_fn, opt_state, params, jr.PRNGKey(0),
+                                          estimator='hutchinson')
+        leaf_h = jax.tree.leaves(st_h[0].leaves, is_leaf=_is_evon_leaf)[0]
+        self.assertIsNotNone(leaf_h.h_hat)
+        self.assertIsNone(leaf_h.noise)
+
+        _, _, st_s = noisy_value_and_grad(loss_fn, opt_state, params, jr.PRNGKey(0),
+                                          estimator='sampling')
+        leaf_s = jax.tree.leaves(st_s[0].leaves, is_leaf=_is_evon_leaf)[0]
+        self.assertIsNotNone(leaf_s.noise)
+        self.assertIsNone(leaf_s.h_hat)
+
+    def test_full_step_jits(self):
+        params = {'w': jnp.ones((4, 3))}
+        opt = evon(1e-2, ess=10.0, hess_init=1.0, precond_every=5)
+        opt_state = opt.init(params)
+
+        def loss_fn(p, key):
+            return 0.5 * jnp.sum(p['w'] ** 2)
+
+        @jax.jit
+        def step(params, opt_state, key):
+            loss, grads, opt_state = noisy_value_and_grad(
+                loss_fn, opt_state, params, key, estimator='hutchinson')
+            updates, opt_state = opt.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+            return params, opt_state, loss
+
+        key = jr.PRNGKey(0)
+        for _ in range(12):
+            key, k = jr.split(key)
+            params, opt_state, loss = step(params, opt_state, k)
+        self.assertTrue(jnp.isfinite(loss))
+
+    def test_hutchinson_converges_on_quadratic(self):
+        # minimize 0.5 * ||W - W*||^2 ; loss should decrease substantially.
+        target = jr.normal(jr.PRNGKey(7), (4, 3))
+        params = {'w': jnp.zeros((4, 3))}
+        opt = evon(2e-1, ess=50.0, hess_init=1.0, precond_every=5)
+        opt_state = opt.init(params)
+
+        def loss_fn(p, key):
+            return 0.5 * jnp.sum((p['w'] - target) ** 2)
+
+        @jax.jit
+        def step(params, opt_state, key):
+            loss, grads, opt_state = noisy_value_and_grad(
+                loss_fn, opt_state, params, key, estimator='hutchinson')
+            updates, opt_state = opt.update(grads, opt_state, params)
+            return optax.apply_updates(params, updates), opt_state, loss
+
+        key = jr.PRNGKey(0)
+        first = None
+        for _ in range(300):
+            key, k = jr.split(key)
+            params, opt_state, loss = step(params, opt_state, k)
+            if first is None:
+                first = loss
+        self.assertLess(float(loss), 0.1 * float(first))
