@@ -216,15 +216,32 @@ def _refresh_side(M, Q, do_refresh, first):
     return Qn32.astype(Q.dtype)
 
 
-def _update_diag_leaf(g, p, leaf, ess, wd, b1, b2):
+_HESS_CLIP_EPS = 1e-8
+
+
+def _clip_hessian(F, H, clip_ratio):
+    """Adaptive element-wise Hessian clip ``clip(F, -gamma(H+eps), gamma(H+eps))``.
+
+    ``F`` is the raw per-step Hessian estimate, ``H`` the current Hessian estimate,
+    and ``clip_ratio`` (gamma) the clip ratio. ``clip_ratio == inf`` disables it.
+    """
+    if clip_ratio == float("inf"):
+        return F
+    bound = clip_ratio * (H + _HESS_CLIP_EPS)
+    return jnp.clip(F, -bound, bound)
+
+
+def _update_diag_leaf(g, p, leaf, ess, wd, b1, b2, hess_clip_ratio=float("inf")):
     Hhat = leaf.h_hat if leaf.h_hat is not None else (leaf.noise * g * precision(leaf.H, ess, wd))
+    Hhat = _clip_hessian(Hhat, leaf.H, hess_clip_ratio)
     G_bar = b1 * leaf.G_bar + (1 - b1) * g
     H = update_hessian(leaf.H, Hhat, b2, wd)
     U = (G_bar + wd * p) / (H + wd)
     return U, DiagEvonLeaf(H=H, G_bar=G_bar, noise=None, h_hat=None)
 
 
-def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
+def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every,
+                        hess_clip_ratio=float("inf")):
     orig_shape = g.shape
     d, o = leaf.H.shape
     G = g.reshape(d, o)
@@ -235,6 +252,7 @@ def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every):
         Hhat = leaf.h_hat
     else:
         Hhat = leaf.noise * Go * precision(leaf.H, ess, wd)
+    Hhat = _clip_hessian(Hhat, leaf.H, hess_clip_ratio)
     G_bar = b1 * leaf.G_bar + (1 - b1) * Go
     H = update_hessian(leaf.H, Hhat, b2, wd)
     Mo = _project(leaf.QL, leaf.QR, M)
@@ -302,6 +320,7 @@ def scale_by_evon(
     weight_decay: float = 1e-4,
     precond_every: int = 10,
     hess_every: int = None,
+    hess_clip_ratio: float = 10.0,
     max_precond_dim: int = 10000,
     one_sided: bool = False,
     m_dtype=None,
@@ -338,10 +357,10 @@ def scale_by_evon(
             if isinstance(s, MatrixEvonLeaf):
                 delta, s_new = _update_matrix_leaf(
                     g, p, s, state.ess, state.weight_decay, b1, b2, b3,
-                    count, state.precond_every)
+                    count, state.precond_every, hess_clip_ratio)
             else:
                 delta, s_new = _update_diag_leaf(
-                    g, p, s, state.ess, state.weight_decay, b1, b2)
+                    g, p, s, state.ess, state.weight_decay, b1, b2, hess_clip_ratio)
             # keep the first-moment accumulator in m_dtype (computed in the
             # promoted dtype above); mirrors IVON's momentum cast.
             if m_dtype is not None:
@@ -370,6 +389,7 @@ def evon(
     weight_decay: float = 1e-4,
     precond_every: int = 10,
     hess_every: int = None,
+    hess_clip_ratio: float = 10.0,
     max_precond_dim: int = 10000,
     one_sided: bool = False,
     m_dtype=None,
@@ -383,6 +403,7 @@ def evon(
     evon_trans = scale_by_evon(
         ess, hess_init, b1=b1, b2=b2, b3=b3, weight_decay=weight_decay,
         precond_every=precond_every, hess_every=hess_every,
+        hess_clip_ratio=hess_clip_ratio,
         max_precond_dim=max_precond_dim, one_sided=one_sided, m_dtype=m_dtype)
     lr_scale = (optax.scale_by_learning_rate(learning_rate),)
     if clip_radius < float("inf"):

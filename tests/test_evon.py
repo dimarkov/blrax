@@ -577,6 +577,51 @@ class TestEvonHutchinsonLeafUpdate(unittest.TestCase):
         self.assertIsNone(s.noise)
 
 
+class TestEvonHessianClip(unittest.TestCase):
+    def test_diag_clip_bounds_estimate(self):
+        # huge h_hat is clipped to gamma*(H+eps) before the EMA.
+        H0 = jnp.full((3,), 0.35)
+        leaf = DiagEvonLeaf(H=H0, G_bar=jnp.zeros(3), h_hat=jnp.full((3,), 1000.0))
+        gamma = 10.0
+        _, s = _update_diag_leaf(jnp.zeros(3), jnp.zeros(3), leaf,
+                                 ess=1.0, wd=1e-4, b1=0.9, b2=0.5,
+                                 hess_clip_ratio=gamma)
+        bound = gamma * (H0 + 1e-8)
+        clipped = jnp.clip(jnp.full((3,), 1000.0), -bound, bound)
+        expected = update_hessian(H0, clipped, 0.5, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+        # and it must differ from the unclipped result
+        unclipped = update_hessian(H0, jnp.full((3,), 1000.0), 0.5, 1e-4)
+        self.assertFalse(jnp.allclose(s.H, unclipped))
+
+    def test_clip_disabled_with_inf_default(self):
+        # default ratio is inf at the function level -> no clipping (back-compat).
+        H0 = jnp.full((3,), 0.35)
+        leaf = DiagEvonLeaf(H=H0, G_bar=jnp.zeros(3), h_hat=jnp.full((3,), 1000.0))
+        _, s = _update_diag_leaf(jnp.zeros(3), jnp.zeros(3), leaf,
+                                 ess=1.0, wd=1e-4, b1=0.9, b2=0.5)
+        expected = update_hessian(H0, jnp.full((3,), 1000.0), 0.5, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+
+    def test_matrix_clip_bounds_estimate(self):
+        H0 = jnp.full((3, 2), 0.35)
+        leaf = MatrixEvonLeaf(L=jnp.eye(3), R=jnp.eye(2), QL=jnp.eye(3), QR=jnp.eye(2),
+                              H=H0, G_bar=jnp.zeros((3, 2)), h_hat=jnp.full((3, 2), 1000.0))
+        gamma = 10.0
+        _, s = _update_matrix_leaf(jnp.zeros((3, 2)), jnp.zeros((3, 2)), leaf,
+                                   ess=1.0, wd=1e-4, b1=0.9, b2=0.5, b3=0.95,
+                                   count=jnp.int32(1), precond_every=jnp.int32(10**6),
+                                   hess_clip_ratio=gamma)
+        bound = gamma * (H0 + 1e-8)
+        clipped = jnp.clip(jnp.full((3, 2), 1000.0), -bound, bound)
+        expected = update_hessian(H0, clipped, 0.5, 1e-4)
+        self.assertTrue(jnp.allclose(s.H, expected))
+
+    def test_evon_default_hess_clip_ratio_is_10(self):
+        self.assertEqual(inspect.signature(evon).parameters['hess_clip_ratio'].default, 10.0)
+        self.assertEqual(inspect.signature(scale_by_evon).parameters['hess_clip_ratio'].default, 10.0)
+
+
 class TestEvonHutchinsonEstimator(unittest.TestCase):
     def _state_at_count(self, opt, params, count):
         state = opt.init(params)
