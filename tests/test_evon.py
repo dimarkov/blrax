@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import unittest
+import inspect
 from jax import random as jr
 
 from blrax.states import (
@@ -504,3 +505,29 @@ class TestEvonCoverage(unittest.TestCase):
                                  weight_decay=0.5, precond_every=10, leaves={'b': leaf})
         expected = jnp.sqrt(1.0 / (2.0 * (H + 0.5)))
         self.assertTrue(jnp.allclose(get_scale(state)['b'], expected, atol=1e-6))
+
+
+class TestEvonHutchinsonConfig(unittest.TestCase):
+    def test_hess_every_defaults_to_precond_every(self):
+        opt = evon(1e-2, ess=1.0, hess_init=1.0, precond_every=7)
+        state = opt.init({'w': jnp.zeros((3, 2))})[0]
+        self.assertEqual(int(state.hess_every), 7)
+        self.assertEqual(int(state.precond_every), 7)
+
+    def test_explicit_hess_every_is_honored(self):
+        opt = scale_by_evon(ess=1.0, hess_init=1.0, precond_every=10, hess_every=5)
+        state = opt.init({'w': jnp.zeros((3, 2))})
+        self.assertEqual(int(state.hess_every), 5)
+
+    def test_b2_default_is_0_95_for_evon(self):
+        self.assertEqual(inspect.signature(evon).parameters['b2'].default, 0.95)
+        self.assertEqual(inspect.signature(scale_by_evon).parameters['b2'].default, 0.95)
+
+    def test_leaves_accept_h_hat_transient(self):
+        m = MatrixEvonLeaf(L=jnp.eye(3), R=jnp.eye(2), QL=jnp.eye(3), QR=jnp.eye(2),
+                           H=jnp.ones((3, 2)), G_bar=jnp.zeros((3, 2)))
+        d = DiagEvonLeaf(H=jnp.ones(4), G_bar=jnp.zeros(4))
+        self.assertIsNone(m.h_hat)
+        self.assertIsNone(d.h_hat)
+        m2 = m._replace(h_hat=jnp.ones((3, 2)))
+        self.assertIsNotNone(m2.h_hat)

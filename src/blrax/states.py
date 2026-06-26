@@ -29,6 +29,7 @@ class MatrixEvonLeaf(NamedTuple):
   H: chex.Array
   G_bar: chex.Array
   noise: Optional[chex.Array] = None
+  h_hat: Optional[chex.Array] = None   # transient: eigenbasis Hessian estimate (Hutchinson)
 
 
 class DiagEvonLeaf(NamedTuple):
@@ -36,6 +37,7 @@ class DiagEvonLeaf(NamedTuple):
   H: chex.Array
   G_bar: chex.Array
   noise: Optional[chex.Array] = None
+  h_hat: Optional[chex.Array] = None   # transient: diagonal Hessian estimate (Hutchinson)
 
 
 class ScaleByEvonState(NamedTuple):
@@ -50,6 +52,7 @@ class ScaleByEvonState(NamedTuple):
   weight_decay: chex.Array     # delta
   precond_every: chex.Array    # T (eigenbasis refresh period)
   leaves: Any
+  hess_every: chex.Array = 1   # HVP cadence for the Hutchinson estimator (constructors set = precond_every)
 
 
 def _is_evon_leaf(x) -> bool:

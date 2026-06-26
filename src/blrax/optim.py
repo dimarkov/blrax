@@ -295,16 +295,19 @@ def scale_by_evon(
     ess: float,
     hess_init: float,
     b1: float = 0.9,
-    b2: float = 0.99999,
+    b2: float = 0.95,
     b3: float = 0.95,
     weight_decay: float = 1e-4,
     precond_every: int = 10,
+    hess_every: int = None,
     max_precond_dim: int = 10000,
     one_sided: bool = False,
     m_dtype=None,
 ) -> optax.GradientTransformation:
     """Rescale updates according to the EVON algorithm (Minut et al., 2026)."""
     m_dtype = utils.canonicalize_dtype(m_dtype)
+    if hess_every is None:
+        hess_every = precond_every
 
     def init_fn(params):
         leaves = jax.tree.map(
@@ -318,6 +321,7 @@ def scale_by_evon(
             ess=ess,
             weight_decay=weight_decay,
             precond_every=jnp.asarray(precond_every, jnp.int32),
+            hess_every=jnp.asarray(hess_every, jnp.int32),
             leaves=leaves,
         )
 
@@ -347,7 +351,8 @@ def scale_by_evon(
         leaves = jax.tree.unflatten(treedef, new_s)
         return updates, ScaleByEvonState(
             count=count, ess=state.ess, weight_decay=state.weight_decay,
-            precond_every=state.precond_every, leaves=leaves)
+            precond_every=state.precond_every, hess_every=state.hess_every,
+            leaves=leaves)
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -358,10 +363,11 @@ def evon(
     hess_init: float = 1.,
     clip_radius: float = float("inf"),
     b1: float = 0.9,
-    b2: float = 0.99999,
+    b2: float = 0.95,
     b3: float = 0.95,
     weight_decay: float = 1e-4,
     precond_every: int = 10,
+    hess_every: int = None,
     max_precond_dim: int = 10000,
     one_sided: bool = False,
     m_dtype=None,
@@ -374,8 +380,8 @@ def evon(
     """
     evon_trans = scale_by_evon(
         ess, hess_init, b1=b1, b2=b2, b3=b3, weight_decay=weight_decay,
-        precond_every=precond_every, max_precond_dim=max_precond_dim,
-        one_sided=one_sided, m_dtype=m_dtype)
+        precond_every=precond_every, hess_every=hess_every,
+        max_precond_dim=max_precond_dim, one_sided=one_sided, m_dtype=m_dtype)
     lr_scale = (optax.scale_by_learning_rate(learning_rate),)
     if clip_radius < float("inf"):
         return optax.chain(evon_trans, optax.clip(clip_radius), *lr_scale)
