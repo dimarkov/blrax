@@ -216,6 +216,36 @@ class TestEvonLeafUpdate(unittest.TestCase):
         new_repr = new.QL @ new.G_bar
         self.assertTrue(jnp.allclose(new_repr, old_repr, atol=1e-4))
 
+    def test_refresh_resorts_hessian_to_follow_column_permutation(self):
+        # Recurring QR power-iteration refresh (count a multiple of precond_every
+        # but NOT the first) sorts the eigenvector columns by descending eigenvalue
+        # estimate. The per-direction Hessian H must follow that SAME permutation,
+        # exactly as SOAP re-sorts its second-moment buffer (exp_avg_sq.index_select)
+        # and as G_bar is rotated here. Otherwise H[k] pairs with the wrong direction.
+        d, o = 3, 1
+        QL = jnp.eye(d)
+        # diag(QL^T L QL) = diag(L) = [1, 100, 10] -> argsort(desc) = [1, 2, 0].
+        L = jnp.diag(jnp.array([1.0, 100.0, 10.0]))
+        H = jnp.array([[10.0], [1.0], [5.0]])    # distinct, identifiable per row
+        idx = jnp.argsort(jnp.diag(QL.T @ L @ QL), descending=True)
+        leaf = MatrixEvonLeaf(L=L, R=None, QL=QL, QR=None,
+                              H=H, G_bar=jnp.zeros((d, o)),
+                              h_hat=jnp.zeros((d, o)))   # Hutchinson branch, no sampler noise
+        g = jnp.array([[0.1], [0.2], [0.3]])
+        p = jnp.zeros((d, o))
+        # b2=1.0 makes the Hessian EMA an exact no-op, so the ONLY change to H is the
+        # re-sort -> we can assert the permutation exactly.
+        _, new = _update_matrix_leaf(g, p, leaf, 10., 0.1, 0.9, 1.0, 0.95,
+                                     count=jnp.asarray(20, jnp.int32),
+                                     precond_every=jnp.asarray(10, jnp.int32))
+        # new column k points at old column idx[k]
+        newcol_to_oldcol = jnp.argmax(jnp.abs(new.QL.T @ QL), axis=1)
+        self.assertTrue(jnp.array_equal(newcol_to_oldcol, idx))
+        # H must be re-sorted to follow the columns (NOT left in the old order).
+        self.assertTrue(jnp.allclose(new.H, H[idx, :]),
+                        msg=f"H not re-sorted: got {new.H.ravel()}, want {H[idx, :].ravel()}")
+        self.assertFalse(jnp.allclose(new.H, H))
+
     def test_no_refresh_leaves_basis_unchanged(self):
         leaf = MatrixEvonLeaf(L=jnp.eye(3) * 2, R=None, QL=jnp.eye(3), QR=None,
                               H=jnp.ones((3, 2)), G_bar=jnp.zeros((3, 2)),

@@ -193,27 +193,41 @@ def ivon(
 
 
 def _qr_power_iter(M32, Q32):
-    """One warm-started power-iteration step; float32 in, float32 out."""
-    eig_est = jnp.diag(Q32.T @ M32 @ Q32)
-    idx = jnp.argsort(eig_est, descending=True)
-    Qs = Q32[:, idx]
-    Qn, _ = jnp.linalg.qr(M32 @ Qs)
-    return Qn
+    """One warm-started power-iteration step; float32 in, float32 out.
+
+    Returns the new orthonormal basis and the column permutation ``idx`` applied
+    to the (warm-started) columns before the QR step: new column ``k`` descends
+    from old column ``idx[k]``. The caller re-sorts the diagonal Hessian by the
+    same ``idx`` so each entry stays paired with its eigenvector -- mirroring
+    SOAP's ``exp_avg_sq.index_select(ind, sort_idx)`` (Vyas et al., 2025).
+    """
+    tmp = M32 @ Q32
+    eig_est = jnp.diag(Q32.T @ tmp)
+    idx = jnp.argsort(eig_est, descending=True).astype(jnp.int32)
+    Qn, _ = jnp.linalg.qr(tmp[:, idx])
+    return Qn, idx
 
 
 def _refresh_side(M, Q, do_refresh, first):
-    """Return the (possibly refreshed) eigenbasis for one side. M, Q non-None."""
+    """Return the (possibly refreshed) eigenbasis and the column permutation.
+
+    ``M, Q`` non-None. The returned ``idx`` is the permutation the caller applies
+    to the diagonal Hessian so it follows the reordered columns; it is the
+    identity when no refresh happens and on the first (from-scratch ``eigh``)
+    bootstrap, where there is no correspondence to the previous columns.
+    """
     M32 = M.astype(jnp.float32)
     Q32 = Q.astype(jnp.float32)
+    eye_idx = jnp.arange(Q32.shape[0], dtype=jnp.int32)
 
     def refresh():
         def via_eigh():
             _, vecs = jnp.linalg.eigh(M32)
-            return vecs[:, ::-1]              # descending eigenvalue order
+            return vecs[:, ::-1], eye_idx     # descending order; no tracked permutation
         return lax.cond(first, via_eigh, lambda: _qr_power_iter(M32, Q32))
 
-    Qn32 = lax.cond(do_refresh, refresh, lambda: Q32)
-    return Qn32.astype(Q.dtype)
+    Qn32, idx = lax.cond(do_refresh, refresh, lambda: (Q32, eye_idx))
+    return Qn32.astype(Q.dtype), idx
 
 
 _HESS_CLIP_EPS = 1e-6
@@ -266,12 +280,23 @@ def _update_matrix_leaf(g, p, leaf, ess, wd, b1, b2, b3, count, precond_every,
     # eigenbasis refresh + momentum rotation (after the param update)
     do_refresh = (count % precond_every) == 0
     first = count == precond_every
-    QL_new = _refresh_side(L, leaf.QL, do_refresh, first) if leaf.QL is not None else None
-    QR_new = _refresh_side(R, leaf.QR, do_refresh, first) if leaf.QR is not None else None
+    QL_new, idxL = (_refresh_side(L, leaf.QL, do_refresh, first)
+                    if leaf.QL is not None else (None, None))
+    QR_new, idxR = (_refresh_side(R, leaf.QR, do_refresh, first)
+                    if leaf.QR is not None else (None, None))
     if leaf.QL is not None:
         G_bar = (QL_new.T @ leaf.QL) @ G_bar
     if leaf.QR is not None:
         G_bar = G_bar @ (leaf.QR.T @ QR_new)
+    # Re-sort the diagonal Hessian to follow the column permutation from the
+    # refresh, keeping H[i, j] paired with eigen-direction (QL_new[:, i],
+    # QR_new[:, j]) -- the same permutation embedded in the G_bar rotation above
+    # and the one SOAP applies to its second-moment buffer. H is NOT rotated into
+    # the new basis (paper p.6); it is only re-labelled.
+    if idxL is not None:
+        H = H[idxL, :]
+    if idxR is not None:
+        H = H[:, idxR]
 
     return delta, MatrixEvonLeaf(L=L, R=R, QL=QL_new, QR=QR_new,
                                  H=H, G_bar=G_bar, noise=None, h_hat=None)
